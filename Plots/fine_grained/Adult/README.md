@@ -48,5 +48,5 @@ LOW\_CONFIG = {
 
 }
 
-
-
+High and low value parameter chosen: the `tuning/high` and `tuning/low` directories
+contain plots produced for the high and low parameter settings used in the paper.

@@ -24,3 +24,6 @@ LOW_CONFIG = {
     "SAVA":               {"batch_size": 1024},
     "RandomEvaluator":    {},
 }
+
+High and low value parameter chosen: the `tuning/high` and `tuning/low` directories
+contain plots produced for the high and low parameter settings used in the paper.
