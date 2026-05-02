@@ -2,7 +2,7 @@
 
 > This is the official code base for **"Data Valuation for Machine Learning: Experiments and Analyses [Experiment, Analysis & Benchmark]"**
 
-Experimental benchmark for data valuation methods in machine learning, covering instance-level and group-level granularities across diverse datasets and scales. Built on top of [OpenDataVal](https://github.com/opendatval/opendatval).
+Experimental benchmark for data valuation methods in machine learning, covering fine-grained and coarse-grained granularities across diverse datasets, tasks, and scales.
 
 ---
 
