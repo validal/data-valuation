@@ -5,6 +5,12 @@
 Experimental benchmark for data valuation methods in machine learning, covering fine-grained and coarse-grained granularities across diverse datasets, tasks, and scales.
 
 ---
+# Use Case
+
+<p align="center">
+  <img src="Usecase/image_use_case.png" alt="Image Use Case" width="500"/>
+</p>
+
 
 ## Repository Structure
 
