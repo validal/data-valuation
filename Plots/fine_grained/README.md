@@ -3,15 +3,17 @@
 This directory contains fine-grained data valuation experiments organized by dataset.
 
 ## Structure
+```
 fine_grained/
 ├── <Dataset>/
-│ ├── tuning/
-│ │ ├── high/ # sensitivity plots (HIGH_CONFIG)
-│ │ └── low/ # sensitivity plots (LOW_CONFIG)
-│ ├── evaluation/ # final benchmark plots
-│ └── README.md # describes HIGH_CONFIG and LOW_CONFIG for the dataset
+│   ├── tuning/
+│   │   ├── high/        # sensitivity plots (HIGH_CONFIG)
+│   │   └── low/         # sensitivity plots (LOW_CONFIG)
+│   ├── evaluation/      # final benchmark plots
+│   └── README.md        # describes HIGH_CONFIG and LOW_CONFIG for the dataset
 ├── legend.pdf
 └── README.md
+```
 
 ## Running Experiments
 - `tuning/high/`: best-performing for high value (HIGH_CONFIG).
