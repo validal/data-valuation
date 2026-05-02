@@ -65,7 +65,6 @@ parser.add_argument('--method', type=str, required=True,
                            'InfluenceSubsample', 'LOO_Random', 'KNNShapley',
                            'DVRL', 'BetaShapley', 'LAVA', 'ALL', 'SAVA'],
                    help='Method to run (or ALL for all methods)')
-parser.add_argument('--job_id', type=int, default=1, help='Job ID for naming outputs')
 parser.add_argument('--batch_size', type=int, default=1024, help='Batch size for SAVA evaluator')
 parser.add_argument('--rs', type=int, default=1, help='Random state for SAVA evaluator')
 args = parser.parse_args()
@@ -73,14 +72,12 @@ args = parser.parse_args()
 # Set seeds
 SEED = args.seed
 METHOD = args.method
-JOB_ID = args.job_id
 SAVA_BATCH_SIZE = args.batch_size
 RS = args.rs
 
 print(f"Running experiment with:")
 print(f"  - SEED: {SEED}")
 print(f"  - METHOD: {METHOD}")
-print(f"  - JOB_ID: {JOB_ID}")
 
 def compute_hepmass_distance_matrix(x_train, x_valid, batch_size=512, cache_file=None):
     """Compute distance matrix for HEPMASS dataset with timing and memory display."""
@@ -738,10 +735,9 @@ def run_method_experiment(method_name):
 
     output_dir = os.path.join(
         BASE_OUTPUT_DIR,
-        f"{METHOD}_{SEED}_JOB{JOB_ID}",
+        f"{METHOD}_{SEED}",
     )
 
-    #output_dir = f'HEPMASS_Results1M/{method_name}_SEED{SEED}_JOB{JOB_ID}'
     os.makedirs(output_dir, exist_ok=True)
     exper_med.set_output_directory(output_dir)
     print(f"\nOutput directory: {output_dir}")
@@ -798,7 +794,6 @@ def run_method_experiment(method_name):
         f.write("=" * 50 + "\n")
         f.write(f"Method: {method_name}\n")
         f.write(f"Seed: {SEED}\n")
-        f.write(f"Job ID: {JOB_ID}\n")
         f.write(f"Completion Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Total Time: {int(hours)}h {int(minutes)}m {seconds:.1f}s\n")
         f.write(f"Output Directory: {output_dir}\n")
@@ -814,92 +809,17 @@ def run_method_experiment(method_name):
 
 
 def run_all_methods():
-    """Run all methods as separate jobs (this function just creates job scripts)."""
-    print("Creating job scripts for all methods...")
-    
-    methods = ['DataOob', 'AME', 'DataBanzhaf', 'DataShapley', 
+    methods = ['DataOob', 'AME', 'DataBanzhaf', 'DataShapley',
                'InfluenceSubsample', 'LOO_Random', 'KNNShapley',
                'DVRL', 'BetaShapley', 'LAVA']
-    
-    # Create a master script to submit all jobs
-    master_script = """#!/bin/bash
-# Master script to submit all HEPMASS data valuation jobs
-
-METHODS=("DataOob" "AME" "DataBanzhaf" "DataShapley" "InfluenceSubsample" 
-         "LOO_Random" "KNNShapley" "DVRL" "BetaShapley" "LAVA")
-
-for method in "${METHODS[@]}"; do
-    echo "Submitting job for method: $method"
-    sbatch run_hepmass_${method}.sh
-    sleep 2
-done
-
-echo "All jobs submitted!"
-"""
-    
-    with open("submit_all_methods.sh", "w") as f:
-        f.write(master_script)
-    
-    os.chmod("submit_all_methods.sh", 0o755)
-    print("Created master script: submit_all_methods.sh")
-    
-    # Create individual job scripts for each method
     for method in methods:
-        job_script = f"""#!/bin/bash
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=56
-#SBATCH --output=logs/run_hepmass_{method}_%j.log
-#SBATCH --error=logs/run_hepmass_{method}_%j.err
-#SBATCH --time=36:00:00
-#SBATCH --job-name=hepmass_{method}
-
-# ---------------------------------
-# Environment setup
-# ---------------------------------
-export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
-
-source ~/.bashrc
-conda activate py39_env
-
-# ---------------------------------
-# Move to script directory
-# ---------------------------------
-cd "/home/mehdi.touil/ondemand/Experimental evaluation/Hepmass/HepMASS1M"
-
-# ---------------------------------
-# Create logs directory
-# ---------------------------------
-mkdir -p logs
-
-# ---------------------------------
-# Run Python script for specific method
-# ---------------------------------
-echo "Starting HEPMASS experiment for method: {method}"
-echo "Job ID: $SLURM_JOB_ID"
-echo "Start time: $(date)"
-
-python run_hepmass_dataval_1M.py --seed 42 --method {method} --job_id $SLURM_JOB_ID
-
-# ---------------------------------
-# Completion message
-# ---------------------------------
-echo "Job completed for method: {method}"
-echo "End time: $(date)"
-echo "Job ID: $SLURM_JOB_ID completed successfully"
-"""
-        
-        script_filename = f"run_hepmass_{method}.sh"
-        with open(script_filename, "w") as f:
-            f.write(job_script)
-        
-        os.chmod(script_filename, 0o755)
-        print(f"Created job script: {script_filename}")
-    
-    print("\nTo run all methods, execute:")
-    print("  ./submit_all_methods.sh")
-    print("\nOr to run a specific method:")
-    print("  sbatch run_hepmass_METHODNAME.sh")
+        print(f"\n{'='*60}\nRunning method: {method}\n{'='*60}")
+        try:
+            run_method_experiment(method)
+        except Exception as e:
+            print(f"Error running {method}: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 if __name__ == "__main__":

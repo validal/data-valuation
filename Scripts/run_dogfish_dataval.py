@@ -49,7 +49,6 @@ parser.add_argument(
         "DVRL", "BetaShapley", "LAVA", "ALL","Sava"
     ],
 )
-parser.add_argument("--job_id", type=int, default=1)
 parser.add_argument(
     "--proportion",
     type=float,
@@ -66,7 +65,6 @@ args = parser.parse_args()
 
 SEED = args.seed
 METHOD = args.method
-JOB_ID = args.job_id
 PROPORTION = args.proportion
 LAM_Y = args.lam_y
 
@@ -74,7 +72,6 @@ LAM_Y = args.lam_y
 print("Running experiment with:")
 print(f"  - SEED: {SEED}")
 print(f"  - METHOD: {METHOD}")
-print(f"  - JOB_ID: {JOB_ID}")
 if LAM_Y is not None:
     print(f"  - LAM_Y: {LAM_Y}")
 
@@ -459,7 +456,7 @@ def run_method_experiment(method_name):
     exper_med = create_experiment_mediator()
     
     # Create output directory with method name
-    output_dir = f'/home/mehdi.touil/lustre/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/Dogfish/{method_name}_SEED{SEED}_JOB{JOB_ID}'
+    output_dir = f'Dogfish_Results/{method_name}_SEED{SEED}'
     os.makedirs(output_dir, exist_ok=True)
     exper_med.set_output_directory(output_dir)
     print(f"\nOutput directory: {output_dir}")
@@ -515,7 +512,6 @@ def run_method_experiment(method_name):
         f.write("=" * 50 + "\n")
         f.write(f"Method: {method_name}\n")
         f.write(f"Seed: {SEED}\n")
-        f.write(f"Job ID: {JOB_ID}\n")
         f.write(f"Completion Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Total Time: {int(hours)}h {int(minutes)}m {seconds:.1f}s\n")
         f.write(f"Output Directory: {output_dir}\n")
@@ -531,91 +527,17 @@ def run_method_experiment(method_name):
 
 
 def run_all_methods():
-    """Run all methods as separate jobs (this function just creates job scripts)."""
-    print("Creating job scripts for all methods...")
-    
-    methods = ['DataOob', 'AME', 'DataBanzhaf', 'DataShapley', 
+    methods = ['DataOob', 'AME', 'DataBanzhaf', 'DataShapley',
                'InfluenceSubsample', 'LOO_Random', 'KNNShapley',
                'DVRL', 'LAVA']
-    
-    # Create a master script to submit all jobs
-    master_script = """#!/bin/bash
-# Master script to submit all DogFish data valuation jobs
-
-METHODS=("DataOob" "AME" "DataBanzhaf" "DataShapley" "InfluenceSubsample" 
-         "LOO_Random" "KNNShapley" "DVRL" "BetaShapley" "LAVA")
-
-for method in "${METHODS[@]}"; do
-    echo "Submitting job for method: $method"
-    sbatch run_dogfish_${method}.sh
-    sleep 2
-done
-
-echo "All jobs submitted!"
-"""
-    
-    with open("submit_all_methods.sh", "w") as f:
-        f.write(master_script)
-    
-    os.chmod("submit_all_methods.sh", 0o755)
-    print("Created master script: submit_all_methods.sh")
-    
-    # Create individual job scripts for each method
     for method in methods:
-        job_script = f"""#!/bin/bash
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --output=logs/run_dogfish_{method}_%j.log
-#SBATCH --error=logs/run_dogfish_{method}_%j.err
-#SBATCH --time=36:00:00
-#SBATCH --job-name=dogfish_{method}
-
-# ---------------------------------
-# Environment setup
-# ---------------------------------
-export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
-
-source ~/.bashrc
-conda activate py39_env
-
-# ---------------------------------
-# Move to script directory
-# ---------------------------------
-cd "/home/mehdi.touil/ondemand/Experimental evaluation/DogFish/"
-
-# ---------------------------------
-# Create logs directory
-# ---------------------------------
-mkdir -p logs
-
-# ---------------------------------
-# Run Python script for specific method
-# ---------------------------------
-echo "Starting  experiment for method: {method}"
-echo "Job ID: $SLURM_JOB_ID"
-echo "Start time: $(date)"
-
-python run_dogfish_dataval.py --seed 42 --method {method} --job_id $SLURM_JOB_ID
-# ---------------------------------
-# Completion message
-# ---------------------------------
-echo "Job completed for method: {method}"
-echo "End time: $(date)"
-echo "Job ID: $SLURM_JOB_ID completed successfully"
-"""
-        
-        script_filename = f"run_dogfish_{method}.sh"
-        with open(script_filename, "w") as f:
-            f.write(job_script)
-        
-        os.chmod(script_filename, 0o755)
-        print(f"Created job script: {script_filename}")
-    
-    print("\nTo run all methods, execute:")
-    print("  ./submit_all_methods.sh")
-    print("\nOr to run a specific method:")
-    print("  sbatch run_dogfish_METHODNAME.sh")
+        print(f"\n{'='*60}\nRunning method: {method}\n{'='*60}")
+        try:
+            run_method_experiment(method)
+        except Exception as e:
+            print(f"Error running {method}: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 if __name__ == "__main__":

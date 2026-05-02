@@ -54,7 +54,6 @@ parser.add_argument(
         "DVRL", "BetaShapley", "LAVA", "SAVA","ALL"
     ],
 )
-parser.add_argument("--job_id", type=int, default=1)
 parser.add_argument(
     "--proportion",
     type=float,
@@ -90,7 +89,6 @@ args = parser.parse_args()
 SEED = args.seed
 RUN_SEED = args.run_seed
 METHOD = args.method
-JOB_ID = args.job_id
 PROPORTION = args.proportion
 NOISE_RATE = args.noise_rate
 K_NEIGHBORS = args.k_neighbors
@@ -100,7 +98,6 @@ NUM_MODELS = args.num_models
 print("Running CIFAR-10 experiment with:")
 print(f"  - SEED: {SEED}")
 print(f"  - METHOD: {METHOD}")
-print(f"  - JOB_ID: {JOB_ID}")
 print(f"  - NOISE_RATE: {NOISE_RATE}")
 print(f"  - K_NEIGHBORS: {K_NEIGHBORS}")
 
@@ -437,7 +434,7 @@ def run_method_experiment(method_name):
     )
     
     # Create output directory
-    output_dir = f'CIFAR10_Results/{method_name}_SEED{SEED}_NOISE{NOISE_RATE}_JOB{JOB_ID}'
+    output_dir = f'CIFAR10_Results/{method_name}_SEED{SEED}_NOISE{NOISE_RATE}'
     os.makedirs(output_dir, exist_ok=True)
     exper_med.set_output_directory(output_dir)
     print(f"\nOutput directory: {output_dir}")
@@ -494,7 +491,6 @@ def run_method_experiment(method_name):
         f.write("=" * 50 + "\n")
         f.write(f"Method: {method_name}\n")
         f.write(f"Seed: {SEED}\n")
-        f.write(f"Job ID: {JOB_ID}\n")
         f.write(f"Noise Rate: {NOISE_RATE}\n")
         f.write(f"Train/Valid/Test: 40000/10000/10000\n")
         f.write(f"Completion Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -516,81 +512,17 @@ def run_method_experiment(method_name):
 # ============================================================
 
 def run_all_methods():
-    """Create job scripts for all methods to run on cluster."""
-    print("Creating job scripts for all methods...")
-    
-    methods = ['DataOob', 'AME', 'DataBanzhaf', 'DataShapley', 
+    methods = ['DataOob', 'AME', 'DataBanzhaf', 'DataShapley',
                'InfluenceSubsample', 'LOO_Random', 'KNNShapley',
                'DVRL', 'BetaShapley', 'LAVA']
-    
-    # Create logs directory
-    os.makedirs("logs", exist_ok=True)
-    
-    # Master script
-    master_script = """#!/bin/bash
-# Master script to submit all CIFAR-10 data valuation jobs
-
-METHODS=("DataOob" "AME" "DataBanzhaf" "DataShapley" "InfluenceSubsample" 
-         "LOO_Random" "KNNShapley" "DVRL" "BetaShapley" "LAVA")
-
-for method in "${METHODS[@]}"; do
-    echo "Submitting job for method: $method"
-    sbatch run_cifar10_${method}.sh
-    sleep 2
-done
-
-echo "All jobs submitted!"
-"""
-    
-    with open("submit_all_cifar10_methods.sh", "w") as f:
-        f.write(master_script)
-    
-    os.chmod("submit_all_cifar10_methods.sh", 0o755)
-    print("Created master script: submit_all_cifar10_methods.sh")
-    
-    # Individual job scripts
     for method in methods:
-        job_script = f"""#!/bin/bash
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=56
-#SBATCH --output=logs/run_cifar10_{method}_%j.log
-#SBATCH --error=logs/run_cifar10_{method}_%j.err
-#SBATCH --time=36:00:00
-#SBATCH --job-name=cifar10_{method}
-
-# Environment setup
-export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
-
-source ~/.bashrc
-conda activate py39_env
-
-# Move to script directory
-cd /path/to/your/experiment/directory
-
-# Create logs directory
-mkdir -p logs
-
-# Run experiment
-echo "Starting CIFAR-10 experiment for method: {method}"
-echo "Job ID: $SLURM_JOB_ID"
-echo "Start time: $(date)"
-
-python run_cifar10_dataval.py --seed 42 --method {method} --job_id $SLURM_JOB_ID --noise_rate 0.2
-
-echo "Job completed for method: {method}"
-echo "End time: $(date)"
-"""
-        
-        script_filename = f"run_cifar10_{method}.sh"
-        with open(script_filename, "w") as f:
-            f.write(job_script)
-        
-        os.chmod(script_filename, 0o755)
-        print(f"Created job script: {script_filename}")
-    
-    print("\nTo run all methods, execute:")
-    print("  ./submit_all_cifar10_methods.sh")
+        print(f"\n{'='*60}\nRunning method: {method}\n{'='*60}")
+        try:
+            run_method_experiment(method)
+        except Exception as e:
+            print(f"Error running {method}: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 # ============================================================

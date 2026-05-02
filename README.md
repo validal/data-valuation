@@ -1,5 +1,7 @@
 # Data Valuation
 
+> This is the official code base for **"Data Valuation for Machine Learning: Experiments and Analyses [Experiment, Analysis & Benchmark]"**
+
 Experimental benchmark for data valuation methods in machine learning, covering instance-level and group-level granularities across diverse datasets and scales. Built on top of [OpenDataVal](https://github.com/opendatval/opendatval).
 
 ---
@@ -77,6 +79,12 @@ All plots and figures are stored in `Plots/`, organized by granularity and exper
 - **`Plots/fine_grained/`** — per-dataset evaluation and tuning results
 - **`Plots/coarse_grained/evaluation/`** and **`/tuning/`** — coarse-grained results
 - **`Plots/Scalability/`** — runtime and performance scaling from 1K to 7M samples
+
+---
+
+## Acknowledgements
+
+This project builds upon several open-source works. We thank the authors of [OpenDataVal](https://github.com/opendatval/opendatval), [LAVA](https://github.com/reds-lab/LAVA/), [SAVA](https://github.com/skezle/sava), [DAVINZ](https://github.com/ZhaoxuanWu/DAVINZ-DataValuation), and [KNN-PVLDB](https://github.com/AI-secure/KNN-PVLDB) for making their implementations publicly available.
 
 ---
 

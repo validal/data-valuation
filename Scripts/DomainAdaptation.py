@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Domain Adaptation using Data Valuation
-Complete SBATCH-ready experiment script
+Domain Adaptation experiment script
 """
 
 import numpy as np
@@ -35,16 +35,14 @@ from opendataval.experiment.exper_methods import (
 parser = argparse.ArgumentParser("Domain Adaptation Data Valuation")
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--method", type=str, default="InfluenceSubsample")
-parser.add_argument("--job_id", type=int, default=1)
 args = parser.parse_args()
 
 SEED = args.seed
 METHOD = args.method
-JOB_ID = args.job_id
 
 np.random.seed(SEED)
 
-print(f"SEED={SEED}, METHOD={METHOD}, JOB_ID={JOB_ID}")
+print(f"SEED={SEED}, METHOD={METHOD}")
 
 # ============================================================
 # Data preparation
@@ -337,7 +335,7 @@ def main():
     print(f"Baseline target accuracy: {baseline:.4f}")
 
     # Output directory
-    out_dir =f"/home/mehdi.touil/lustre/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/domain adaptation/{METHOD}_SEED{SEED}_JOB{JOB_ID}"
+    out_dir = f"DomainAdaptation_Results/{METHOD}_SEED{SEED}"
 
     os.makedirs(out_dir, exist_ok=True)
     exper_med.set_output_directory(out_dir)
