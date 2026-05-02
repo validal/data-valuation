@@ -35,16 +35,6 @@ data-valuation/
 └── setup.py
 ```
 
----
-
-## Methods
-
-**Fine-Grained (instance-level):** AME, DVRL, InfluenceFunction, KNNShapley, DataShapley, DataBanzhaf, BetaShapley, DataOob, LeaveOneOut, LAVA/SAVA, GAVA, ForgettingEvents, ClassWiseShapley, RobustVolumeShapley, DVRLShap, RandomEvaluator
-
-**Coarse-Grained (group-level):** MMD, NTK, OT (Wasserstein), RV, DAVINZ
-
----
-
 ## Setup
 
 ```bash
