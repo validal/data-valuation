@@ -11,26 +11,23 @@ Experimental benchmark for data valuation methods in machine learning, covering 
 ```
 data-valuation/
 ├── src/
-│   ├── fine_grained/          # Instance-level valuation
+│   ├── fine_grained/          # Fine-grained valuation
 │   │   ├── __main__.py        # CLI entry point (Typer)
 │   │   ├── dataloader/        # Dataset fetching, noise injection, registration
-│   │   ├── dataval/           # 16+ valuation methods (AME, DVRL, Shapley variants, LAVA, ...)
+│   │   ├── dataval/           # Pointwise valuation methods (AME, DVRL, LAVA, ...)
 │   │   ├── experiment/        # ExperimentMediator orchestration harness
-│   │   └── model/             # Model wrappers (MLP, BERT, LeNet, LogReg)
-│   └── coarse_grained/        # Group-level valuation
-│       ├── baselines/         # MMD, NTK, OT, RV, DAVINZ
-│       ├── models/            # CNN, ResNet, VGG, tabular MLP
-│       ├── scripts/           # Bootstrap correlation & robustness experiments
-│       └── utilities/         # PyTorch helpers, plotting
-├── Scripts/                   # Dataset-specific runners (Adult, CIFAR-10, HEP mass 1K–7M, ...)
+│   │   └── model/             # Models
+│   └── coarse_grained/        # Coarse-grained valuation
+│       ├── baselines/         # OT, RVol, DAVINZ (NTK-MMD)
+│       ├── models/            # CNN, ResNet, MLP
+│       ├── scripts/           # MPerf correlation & robustness & sensitivity experiments
+│       └── utilities/         # helpers
+├── Scripts/                   # Full data valuation pipeline (Adult, CIFAR-10, HEP mass 1K–7M, ...)
 ├── Plots/                     # Experiment results
 │   ├── fine_grained/          # Per-dataset evaluation plots (Adult, CIFAR-10, DogFish, ...)
-│   │   └── (tuning inside)    # Hyperparameter tuning results per dataset
-│   ├── coarse_grained/
-│   │   ├── evaluation/        # Coarse-grained evaluation results
-│   │   └── tuning/            # Coarse-grained tuning results
+│   │   └── (tuning inside)    # parameter tuning results per dataset
 │   └── Scalability/           # Scalability results for fine- and coarse-grained methods
-├── data/                      # Datasets (numpy arrays: X/y source, val, test)
+├── data/                      # Datasets for reproducibility
 ├── requirements.txt
 └── setup.py
 ```
