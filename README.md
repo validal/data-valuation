@@ -76,9 +76,8 @@ python src/coarse_grained/scripts/robustness.py --help
 ## Results
 
 All plots and figures are stored in `Plots/`, organized by granularity and experiment type:
-- **`Plots/fine_grained/`** — per-dataset evaluation and tuning results
-- **`Plots/coarse_grained/evaluation/`** and **`/tuning/`** — coarse-grained results
-- **`Plots/Scalability/`** — runtime and performance scaling from 1K to 7M samples
+- **`Plots/fine_grained/`** — per-dataset evaluation and tuning results (Figures 4-5-6-7-8)
+- **`Plots/Scalability/`** — runtime and performance scaling (Figure 9)
 
 ---
 
