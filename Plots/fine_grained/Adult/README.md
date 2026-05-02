@@ -1,52 +1,86 @@
-HIGH\_CONFIG = {
-
-&#x20;   "DataOOB":            {"num\_models": 10,      "proportion": 0.1},
-
-&#x20;   "InfluenceSubsample": {"num\_models": 300000,  "subset\_size": 3000},
-
-&#x20;   "DataBanzhaf":        {"num\_models": 350000},
-
-&#x20;   "DVRL":               {"rl\_epochs": 3000,     "rl\_batch\_size": 32},
-
-&#x20;   "KNNShapley":         {"k\_neighbors": 5000},
-
-&#x20;   "AKShapley":          {"k\_neighbors": 10, "n\_hash\_table": 100, "eps": 0.01, "alpha": 0.5},
-
-&#x20;   "LAVA":               {"lam\_y": 10},
-
-&#x20;   "SAVA":               {"batch\_size": 1024, "lam\_x": 1.0, "lam\_y": 10.0, "p": 2, "blur": 0.05, "mode": "cls", "debug": True, "stratified\_batches": True},
-
-&#x20;   "LeaveOneOut":        {},
-
-&#x20;   "RandomEvaluator":    {},
-
+# High-value configuration (best-performing settings)
+HIGH_CONFIG = {
+    "DataOOB": {
+        "num_models": 10,
+        "proportion": 0.1,
+    },
+    "InfluenceSubsample": {
+        "num_models": 300_000,
+        "subset_size": 3_000,
+    },
+    "DataBanzhaf": {
+        "num_models": 350_000,
+    },
+    "DVRL": {
+        "rl_epochs": 3_000,
+        "rl_batch_size": 32,
+    },
+    "KNNShapley": {
+        "k_neighbors": 5_000,
+    },
+    "AKShapley": {
+        "k_neighbors": 10,
+        "n_hash_table": 100,
+        "eps": 0.01,
+        "alpha": 0.5,
+    },
+    "LAVA": {
+        "lam_y": 10,
+    },
+    "SAVA": {
+        "batch_size": 1024,
+        "lam_x": 1.0,
+        "lam_y": 10.0,
+        "p": 2,
+        "blur": 0.05,
+        "mode": "cls",
+        "debug": True,
+        "stratified_batches": True,
+    },
+    "LeaveOneOut": {},
+    "RandomEvaluator": {},
 }
 
 
-
-LOW\_CONFIG = {
-
-&#x20;   "DataOOB":            {"num\_models": 10,      "proportion": 0.1},
-
-&#x20;   "InfluenceSubsample": {"num\_models": 300000,  "subset\_size": 100},
-
-&#x20;   "DataBanzhaf":        {"num\_models": 100000},
-
-&#x20;   "DVRL":               {"rl\_epochs": 5000,     "rl\_batch\_size": 64},
-
-&#x20;   "KNNShapley":         {"k\_neighbors": 10},
-
-&#x20;   "AKShapley":          {"k\_neighbors": 10, "n\_hash\_table": 100, "eps": 0.01, "alpha": 0.5},
-
-&#x20;   "LAVA":               {"lam\_y": 10},
-
-&#x20;   "SAVA":               {"batch\_size": 1024, "lam\_x": 1.0, "lam\_y": 10.0, "p": 2, "blur": 0.05, "mode": "cls", "debug": True, "stratified\_batches": True},
-
-&#x20;   "LeaveOneOut":        {},
-
-&#x20;   "RandomEvaluator":    {},
-
+# Low-value configuration (weaker / under-tuned settings)
+LOW_CONFIG = {
+    "DataOOB": {
+        "num_models": 10,
+        "proportion": 0.1,
+    },
+    "InfluenceSubsample": {
+        "num_models": 300_000,
+        "subset_size": 100,
+    },
+    "DataBanzhaf": {
+        "num_models": 100_000,
+    },
+    "DVRL": {
+        "rl_epochs": 5_000,
+        "rl_batch_size": 64,
+    },
+    "KNNShapley": {
+        "k_neighbors": 10,
+    },
+    "AKShapley": {
+        "k_neighbors": 10,
+        "n_hash_table": 100,
+        "eps": 0.01,
+        "alpha": 0.5,
+    },
+    "LAVA": {
+        "lam_y": 10,
+    },
+    "SAVA": {
+        "batch_size": 1024,
+        "lam_x": 1.0,
+        "lam_y": 10.0,
+        "p": 2,
+        "blur": 0.05,
+        "mode": "cls",
+        "debug": True,
+        "stratified_batches": True,
+    },
+    "LeaveOneOut": {},
+    "RandomEvaluator": {},
 }
-
-High and low value parameter chosen: the `tuning/high` and `tuning/low` directories
-contain plots produced for the high and low parameter settings used in the paper.
