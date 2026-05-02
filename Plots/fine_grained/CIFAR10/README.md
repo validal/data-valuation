@@ -1,29 +1,34 @@
-HIGH_CONFIG = {
-    "DataOOB":            {"num_models": 100,    "proportion": 0.1},
-    "InfluenceSubsample": {"num_models": 100000, "subset_size": 4000},
-    "DataBanzhaf":        {"num_models": 20000},
-    "DVRL":               {"rl_epochs": 5000,  "rl_batch_size": 128},
-    "DataShapley":        {"mc_epochs": 500},
-    "KNNShapley":         {"k_neighbors": 50},
-    "AKShapley":          {"k_neighbors": 100, "n_hash_table": 100, "eps": 0.001, "alpha": 0.5},
-    "LAVA":               {"lam_y": 10},
-    "AME":                {"num_models": 5000},
-    "LeaveOneOut":        {},
-    "SAVA":               {"batch_size": 1024},
-    "RandomEvaluator":    {},
-}
+## High and Low Value Parameter Configurations
 
-LOW_CONFIG = {
-    "DataOOB":            {"num_models": 100,    "proportion": 1.0},
-    "InfluenceSubsample": {"num_models": 500000,  "proportion": 100},
-    "DataBanzhaf":        {"num_models": 10000},
-    "DVRL":               {"rl_epochs": 5000,  "rl_batch_size": 128},
-    "KNNShapley":         {"k_neighbors": 10},
-    "AKShapley":          {"k_neighbors": 100, "n_hash_table": 100, "eps": 0.001, "alpha": 0.5},
-    "LAVA":               {"lam_y": 1},
-    "SAVA":               {"batch_size": 1024},
-    "RandomEvaluator":    {},
-}
+### HIGH_CONFIG (high value)
 
-High and low value parameter chosen: the `tuning/high` and `tuning/low` directories
-contain plots produced for the high and low parameter settings used in the paper.
+- **DOOB**: `num_models=100`, `proportion=0.1`  
+- **InfSub**: `num_models=100000`, `subset_size=4000`  
+- **DBanzhaf**: `num_models=20000`  
+- **DVRL**: `rl_epochs=5000`, `rl_batch_size=128`  
+- **DShapley**: `mc_epochs=500`  
+- **KShapley**: `k_neighbors=50`  
+- **AKShapley**: `k_neighbors=100`, `n_hash_table=100`, `eps=0.001`, `alpha=0.5`  
+- **LAVA**: `lam_y=10`  
+- **AME**: `num_models=5000`  
+- **LOO**  
+- **SAVA**: `batch_size=1024`  
+- **Rand**
+
+---
+
+### LOW_CONFIG (low value)
+
+- **DOOB**: `num_models=100`, `proportion=1.0`  
+- **InfSub**: `num_models=500000`, `proportion=100`  
+- **DBanzhaf**: `num_models=10000`  
+- **DVRL**: `rl_epochs=5000`, `rl_batch_size=128`  
+- **KShapley**: `k_neighbors=10`  
+- **AKShapley**: `k_neighbors=100`, `n_hash_table=100`, `eps=0.001`, `alpha=0.5`  
+- **LAVA**: `lam_y=1`  
+- **SAVA**: `batch_size=1024`  
+- **Rand**
+
+---
+
+
