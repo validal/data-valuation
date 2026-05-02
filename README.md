@@ -7,7 +7,7 @@ Experimental benchmark for data valuation methods in machine learning, covering 
 ---
 # Use Case
 
-<p align="center">
+<p align="left">
   <img src="./Usecase/dval-use-case.png" alt="Image Use Case" width="500"/>
 </p>
 
