@@ -51,14 +51,14 @@ pip install -e .
 # Fine-grained CLI
 python -m src.fine_grained --help
 
-# Dataset-specific runner (supports --method and --seed)
-python Scripts/run_adult_dataval.py --method DataOob --seed 42
-python Scripts/run_cifar10_dataval.py --method KNNShapley --seed 42
-python Scripts/run_hepmass_dataval_100k.py --method LAVA --seed 42
+# Fine-grained scripts
+python Scripts/run_adult_dataval.py --method DataOob 
+python Scripts/run_cifar10_dataval.py --method KNNShapley 
+python Scripts/run_hepmass_dataval_100k.py --method LAVA 
 
 # Coarse-grained scripts
-python src/coarse_grained/scripts/boostrap.py --help
-python src/coarse_grained/scripts/robustness.py --help
+python src/coarse_grained/scripts/boostrap.py 
+python src/coarse_grained/scripts/robustness.py
 ```
 
 ---
