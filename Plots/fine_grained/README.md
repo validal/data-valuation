@@ -7,9 +7,9 @@ This directory contains fine-grained data valuation experiments organized by dat
 fine_grained/
 ├── <Dataset>/
 │   ├── tuning/
-│   │   ├── high/        # sensitivity plots (HIGH_CONFIG)
-│   │   └── low/         # sensitivity plots (LOW_CONFIG)
-│   ├── evaluation/      # final benchmark plots
+│   │   ├── high/        # high value tuning (HIGH_CONFIG)
+│   │   └── low/         # low value tuning (LOW_CONFIG)
+│   ├── evaluation/      # final evaluation plots (high/low vakue removal and noisy detection)
 │   └── README.md        # describes HIGH_CONFIG and LOW_CONFIG for the dataset
 ├── legend.pdf
 └── README.md
