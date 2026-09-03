@@ -1,34 +1,23 @@
 # run_cifar10_dataval.py
 
 from random import seed
-from sklearn.utils import shuffle
 import numpy as np
 import pandas as pd
-from matplotlib import pyplot as plt
-from typing import Optional, Union, List, Dict
 import json
 import os
 import sys
-from pathlib import Path
 import argparse
 import time
-from sklearn.utils import check_random_state
-from sklearn.linear_model import LogisticRegression
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.preprocessing import StandardScaler
 import torch
 
 # Ensure dataset registry
-import opendataval.dataloader.datasets
 
 from opendataval.dataloader import mix_labels, DataFetcher
 from opendataval.dataval import (
     AME, DVRL, BetaShapley, DataBanzhaf, DataOob, DataShapley,
-    InfluenceSubsample, KNNShapley, LavaEvaluator, ParallelLavaOOBEvaluator,
-    LeaveOneOut, RandomEvaluator, Kairos, InRunDataShapleyGhost, LoGRA
+    InfluenceSubsample, KNNShapley, LavaEvaluator, RandomEvaluator, InRunDataShapleyGhost, LoGRA
 )
 from opendataval.dataval.lava import SavaEvaluator
-from opendataval.dataval.kairos.bkairos import bKairos
 from opendataval.experiment import ExperimentMediator
 from opendataval.experiment.exper_methods    import (
     discover_corrupted_sample,
@@ -36,7 +25,6 @@ from opendataval.experiment.exper_methods    import (
     remove_high_low,
     save_dataval
 )
-from opendataval.model.api import ClassifierSkLearnWrapper
 from opendataval.dataval.knnshap import KNNShapleyLSH
 
 # ============================
@@ -51,7 +39,7 @@ parser.add_argument(
     required=True,
     choices=[
         "DataOob", "AME", "DataBanzhaf", "DataShapley",
-        "InfluenceSubsample", "LOO_Random", "KNNShapley", "AKShapley", "KAIROS",
+        "InfluenceSubsample", "KNNShapley", "AKShapley", "KAIROS",
         "DVRL", "BetaShapley", "LAVA", "SAVA", "InRunDataShapleyGhost", "LoGRA", "ALL"
     ],
 )
@@ -244,21 +232,21 @@ def set_global_seeds(seed=42):
 # ============================================================
 
 def create_experiment_mediator(cache_dir="./data_files/", seed=42):
-    """Create experiment mediator for CIFAR-10 with ResNet9 embeddings (128-dim).
+    """Create experiment mediator for CIFAR-10 with ResNet18 embeddings (512-dim).
 
-    Input: x_train shape (40000, 128) from registered cifar10-embedding-resnet9 dataset
+    Input: x_train shape (40000, 512) from registered cifar10-embedding-resnet18 dataset.
     """
 
     print("\n" + "="*60)
-    print("CREATING EXPERIMENT MEDIATOR (ResNet9 128-dim embeddings)")
+    print("CREATING EXPERIMENT MEDIATOR (ResNet18 512-dim embeddings)")
     print("="*60)
         # Load the registered embedding dataset
-    print("\nLoading registered dataset 'cifar10-embedding-resnet9'...")
+    print("\nLoading registered dataset 'cifar10-embedding-resnet18'...")
     # Fixed split seed so train/valid/test indices never change across --seed runs;
     # label noise (below) still varies with SEED.
     SPLIT_SEED = 42
     fetcher = DataFetcher(
-        "cifar10-embedding-resnet9",
+        "cifar10-embedding-resnet18",
         cache_dir=cache_dir,
         random_state=SPLIT_SEED
     )
@@ -274,7 +262,7 @@ def create_experiment_mediator(cache_dir="./data_files/", seed=42):
     fetcher = fetcher.noisify(mix_labels, noise_rate=NOISE_RATE, rng=SEED)
 
     # Prediction model: ClassifierMLP with auto-detected input dimension
-    input_dim = fetcher.x_train.shape[1]  # Auto-detect from embeddings (128-dim for ResNet9)
+    input_dim = fetcher.x_train.shape[1]  # Auto-detect from embeddings (512-dim for ResNet18)
     print(f"\nCreating ClassifierMLP with parameters:")
     print(f"  input_dim: {input_dim} (auto-detected from embeddings)")
     print(f"  num_classes: 10")
@@ -383,8 +371,6 @@ def create_method_evaluators(method_name, output_dir=None):
             )
         ]
 
-    elif method_name == "LOO_Random":
-        evaluators = [RandomEvaluator(random_state=SEED)]
     elif method_name == "KAIROS":
         # ONE evaluator - kernels computed once, lambda tuned later
         lambda_weight = LAMBDA_WEIGHT if LAMBDA_WEIGHT is not None else 0.97
@@ -509,8 +495,7 @@ def create_method_evaluators(method_name, output_dir=None):
             ('pca', 'kfac'),
             ('pca', 'ekfac'),
             ('pca', 'raw'),
-            ('random', 'kfac'),
-        ]
+            ('random', 'kfac')]
         evaluators = [
             LoGRA(
                 epochs=EPOCHS,
@@ -526,7 +511,7 @@ def create_method_evaluators(method_name, output_dir=None):
 
     elif method_name == "ALL":
         evaluators = []
-        for m in ["DataOob", "KNNShapley", "LOO_Random"]:
+        for m in ["DataOob", "KNNShapley"]:
             evaluators.extend(create_method_evaluators(m, output_dir))
             
     else:
@@ -615,10 +600,10 @@ def save_time_memory_report(exper_med, output_dir, method_name):
 # ============================================================
 
 def run_method_experiment(method_name):
-    """Run data valuation experiment on CIFAR-10 with ResNet9 embeddings (128-dim).
+    """Run data valuation experiment on CIFAR-10 with ResNet18 embeddings (512-dim).
 
     Data flow:
-    1. Load cifar10-embedding-resnet9 dataset (cached after first run)
+    1. Load cifar10-embedding-resnet18 dataset (cached after first run)
     2. Apply deterministic split: 40K train, 10K valid, 10K test (seed=42)
     3. Add label noise (20% by default)
     4. Compute data values using specified method
@@ -662,7 +647,7 @@ def run_method_experiment(method_name):
     # Special handling for KAIROS: evaluate each lambda (kernel reuse)
     if method_name == "KAIROS":
         import time as time_module
-        LAMBDA_VALUES = [0, 0.5, 0.9, 0.95, 0.97, 0.99, 1]
+        LAMBDA_VALUES = [0, 0.5, 0.8, 0.9, 0.97, 1.0]
         evaluator = all_evaluators[0]
         base_output_dir = output_dir
         lambda_timing_results = []
@@ -750,8 +735,8 @@ def run_method_experiment(method_name):
 
     # Save final summary
     summary_path = os.path.join(output_dir, f"summary_{method_name}.txt")
-    data_source = "ResNet9 embeddings (generated)"
-    feature_dim = "128-dim"
+    data_source = "ResNet18 embeddings (generated)"
+    feature_dim = "512-dim"
     with open(summary_path, 'w') as f:
         f.write(f"CIFAR-10 Data Valuation - {method_name}\n")
         f.write("=" * 70 + "\n\n")
@@ -795,7 +780,7 @@ def run_all_methods():
     print("Creating job scripts for all methods...")
     
     methods = ['DataOob', 'AME', 'DataBanzhaf', 'DataShapley',
-               'InfluenceSubsample', 'LOO_Random', 'KNNShapley', 'KAIROS',
+               'InfluenceSubsample', 'KNNShapley', 'KAIROS',
                'DVRL', 'BetaShapley', 'LAVA']
     
     # Create logs directory
@@ -806,7 +791,7 @@ def run_all_methods():
 # Master script to submit all CIFAR-10 data valuation jobs
 
 METHODS=("DataOob" "AME" "DataBanzhaf" "DataShapley" "InfluenceSubsample" 
-         "LOO_Random" "KNNShapley" "DVRL" "BetaShapley" "LAVA")
+         "KNNShapley" "DVRL" "BetaShapley" "LAVA")
 
 for method in "${METHODS[@]}"; do
     echo "Submitting job for method: $method"

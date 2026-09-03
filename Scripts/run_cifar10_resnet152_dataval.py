@@ -2,7 +2,7 @@
 """
 H100-Optimized CIFAR10 + ResNet Data Valuation Experiment (Unified Pipeline)
 
-This is the unified training pipeline for ALL ResNet models (9, 18, 34, 50, 101, 152, 110).
+This is the training pipeline for ResNet9
 All models use identical H100-optimized training hyperparameters for fair comparison.
 
 Key H100 Optimizations:
@@ -17,16 +17,16 @@ Key H100 Optimizations:
   ✓ Unified configuration (all models use same hyperparams)
 
 Usage Examples:
-  # ResNet-101 with LoGRA
-  python run_cifar10_resnet152_dataval.py --model resnet152 --cuda 0 --seed 42 --method LoGRA
+  # ResNet-9 with LoGRA
+  python run_cifar10_resnet9_dataval.py --model rn9 --cuda 0 --seed 42 --method LoGRA
+  
+  # ResNet-50 with full evaluation
+  python run_cifar10_resnet9_dataval.py --model resnet50 --cuda 0 --seed 42 --method ALL
+  
+  # ResNet152 with InRunDataShapleyGhost
+  python run_cifar10_resnet9_dataval.py --model resnet152 --cuda 0 --seed 42 --method InRunDataShapleyGhost
 
-  # ResNet-101 with full evaluation
-  python run_cifar10_resnet152_dataval.py --model resnet152 --cuda 0 --seed 42 --method ALL
-
-  # ResNet-101 with InRunDataShapleyGhost
-  python run_cifar10_resnet152_dataval.py --model resnet152 --cuda 0 --seed 42 --method InRunDataShapleyGhost
-
-Updated: 2026-08-03
+Updated: 2026-07-29
 Scalability Study: Fair comparison across model depths with H100 optimizations
 """
 
@@ -38,20 +38,6 @@ os.environ['MKL_THREADING_LAYER'] = 'GNU'
 import numpy as np
 import pandas as pd
 import torch
-
-# Completely disable torch.compile to avoid triton cubin cache corruption during DataOob
-# This is a workaround for triton kernel compilation failures when training 100+ models
-try:
-    torch._dynamo.config.suppress_errors = True
-except Exception as e:
-    print(f"[INIT] Could not set suppress_errors: {e}")
-
-# Replace torch.compile with identity function (returns model uncompiled)
-_orig_torch_compile = torch.compile
-torch.compile = lambda model, *args, **kwargs: model
-
-print("[INIT] torch.compile DISABLED - all models will run uncompiled to avoid triton cubin errors")
-
 import torch.nn as nn
 from pathlib import Path
 import argparse
@@ -60,7 +46,6 @@ import json
 import sys
 import logging
 import psutil
-import tracemalloc
 import threading
 from typing import Optional, Dict, Any
 
@@ -88,44 +73,85 @@ except ImportError:
 from opendataval.dataloader import mix_labels
 from opendataval.dataval import (
     AME, DVRL, BetaShapley, DataBanzhaf, DataOob, DataShapley,
-    InfluenceSubsample, KNNShapley, LeaveOneOut, RandomEvaluator,
+    InfluenceSubsample, KNNShapley, RandomEvaluator,
     LoGRA, InfluenceFunction, InRunDataShapleyGhost
 )
-from opendataval.dataval.knnshap import KNNShapleyLSH, KNNShapleyVec, AKShapleyGPU
 from opendataval.dataval.lava import LavaEvaluator, SavaEvaluator
 from opendataval.dataval.influence.infsub_ckpt import InfluenceSubsampleCKPT
 from opendataval.dataval.oob.dataoob_ckpt import DataOobCKPT
-from opendataval.dataval.influence.inrun_shapley_ckpt import InRunShapleyCKPT
 from opendataval.experiment import ExperimentMediator
 from opendataval.experiment.exper_methods import (
     discover_corrupted_sample, noisy_detection, remove_high_low, save_dataval
 )
 
-# Apply gradient checkpointing patch for Resnet152
-try:
-    from logra_gradient_checkpoint_patch import patch_logra
-    patch_logra()
-    print("✓ LoGRA gradient checkpointing patch loaded")
-except ImportError:
-    print("⚠ Gradient checkpointing patch not found")
+def _class_ids(labels):
+    """Convert scalar or one-hot labels to one-dimensional class IDs."""
+    labels = np.asarray(labels)
+    if labels.ndim > 1 and labels.shape[1] > 1:
+        return np.argmax(labels, axis=1)
+    return labels.reshape(-1)
+
+
+def mix_labels_and_print_distribution(
+    fetcher, noise_rate=0.2, rng=None, noise_random_state=None
+):
+    """Inject label noise and print its per-class distribution."""
+    clean_labels = _class_ids(np.asarray(fetcher.y_train).copy())
+    noise_updates = mix_labels(
+        fetcher,
+        noise_rate=noise_rate,
+        rng=rng,
+        noise_random_state=noise_random_state,
+    )
+    noisy_labels = _class_ids(noise_updates["y_train"])
+    noisy_indices = np.asarray(noise_updates["noisy_train_indices"], dtype=int)
+
+    selected = np.zeros(len(clean_labels), dtype=bool)
+    selected[noisy_indices] = True
+    classes = np.unique(clean_labels)
+
+    print("\n[Noise] Training-label distribution by source class:")
+    print("  class | noisy / total | class noise rate | noisy-label destinations")
+    for class_id in classes:
+        class_mask = clean_labels == class_id
+        class_noisy = class_mask & selected
+        total_count = int(class_mask.sum())
+        noisy_count = int(class_noisy.sum())
+        class_rate = 100.0 * noisy_count / total_count if total_count else 0.0
+
+        targets, target_counts = np.unique(
+            noisy_labels[class_noisy], return_counts=True
+        )
+        transitions = ", ".join(
+            f"{target}: {count}"
+            for target, count in zip(targets.tolist(), target_counts.tolist())
+        )
+        print(
+            f"  {str(class_id):>5} | {noisy_count:>5} / {total_count:<5} | "
+            f"{class_rate:>15.2f}% | {transitions or '-'}"
+        )
+
+    overall_rate = 100.0 * len(noisy_indices) / len(clean_labels)
+    print(
+        f"  Total noisy training labels: {len(noisy_indices)}/{len(clean_labels)} "
+        f"({overall_rate:.2f}%)\n"
+    )
+    return noise_updates
+
 
 # Optional imports
 try:
-    from opendataval.dataval.kairos.bkairos import bKairos
-    from opendataval.dataval.kairos.kairos import Kairos
     from opendataval.dataval.kairos.kairosgpu import KairosGPU
     KAIROS_AVAILABLE = True
 except (ImportError, AttributeError):
     KAIROS_AVAILABLE = False
 
 try:
-    from ghostEngines import GradDotProdEngine
     GHOSTENGINES_AVAILABLE = True
 except ImportError:
     GHOSTENGINES_AVAILABLE = False
 
 try:
-    import logix
     LOGIX_AVAILABLE = True
 except ImportError:
     LOGIX_AVAILABLE = False
@@ -277,20 +303,6 @@ class DualWriter:
         return self.console.isatty()
 
 
-def get_gpu_type_suffix():
-    """Detect GPU type and return suffix for directory naming."""
-    try:
-        gpu_name = torch.cuda.get_device_name(0)
-        if 'A100' in gpu_name:
-            return '_A100'
-        elif 'H100' in gpu_name:
-            return ''  # No suffix for H100
-        else:
-            return f"_{gpu_name.split()[-1]}" if gpu_name else ''
-    except:
-        return ''
-
-
 # ============================================================================
 # SETUP & LOGGING
 # ============================================================================
@@ -352,7 +364,9 @@ def get_evaluator_suffix(evaluator):
     if "InfluenceSubsample" in evaluator_str:
         if (m := re.search(r'num_models=(\d+)', evaluator_str)):
             params.append(f"m{m.group(1)}")
-        if (m := re.search(r'proportion=([0-9.]+)', evaluator_str)):
+        if (m := re.search(r'subset_size=(\d+)', evaluator_str)):
+            params.append(f"ss{m.group(1)}")
+        elif (m := re.search(r'proportion=([0-9.]+)', evaluator_str)):
             params.append(f"p{m.group(1)}")
     elif "DataOob" in evaluator_str:
         if (m := re.search(r'num_models=(\d+)', evaluator_str)):
@@ -405,16 +419,16 @@ def set_global_seeds(seed):
 
 def get_unified_train_kwargs(model_name: str) -> Dict[str, Any]:
     """Get unified training kwargs for the model.
-
+    
     If unified_config is available, use it. Otherwise, use sensible defaults.
     """
     # if UNIFIED_CONFIG_AVAILABLE:
     #     return get_training_config(model_name)
-
+    
     # Fallback configuration (all models use these settings)
     default_config = {
-        "epochs": 100,
-        "batch_size": 512,
+        "epochs": 50,
+        "batch_size": 1024,
         "lr": 0.0028,
         "weight_decay": 5e-4,
         "label_smoothing": 0.0,
@@ -432,7 +446,6 @@ def create_experiment_mediator(
     valid_count: int = 10000,
     test_count: int = 10000,
     noise_rate: float = 0.2,
-    train_validation_model: bool = False,
 ):
     """Create ExperimentMediator with H100-optimized unified config."""
     print(f"\n[Setup] Creating CIFAR10 {model_name} experiment (H100-Optimized)...")
@@ -462,12 +475,11 @@ def create_experiment_mediator(
         train_count=train_count,
         valid_count=valid_count,
         test_count=test_count,
-        add_noise=mix_labels,
-        noise_kwargs={'noise_rate': 0.2},
+        add_noise=mix_labels_and_print_distribution,
+        noise_kwargs={'noise_rate': noise_rate},
         train_kwargs=TRAIN_KWARGS,
         model_name=model_name,
         metric_name=metric_name,
-        train_validation_model=train_validation_model,
         train_baseline_model=False,  # ✅ Train baseline ResNet at the beginning
         random_state=seed,
         device=device
@@ -527,118 +539,31 @@ def create_imagenet_embedding_model(device=None, renorm=True):
     return net
 
 
-def create_embedding_model():
-    """Create H100-optimized embedding model with feature extraction."""
-    from opendataval.model.resnet import ResNet152
-
-    embedding_model = ResNet152(num_classes=10)
-    embedding_model.load_state_dict(
-        torch.load("./checkpoints/validation_model/model.pth", map_location="cpu")
-    )
-
-    # For ResNet152, extract features by removing the classification head (fc layer)
-    # ResNet152 structure: conv1->bn1->relu -> layer1->layer2->layer3->layer4 -> avgpool -> flatten -> fc
-    # We want: conv1->bn1->relu -> layer1->layer2->layer3->layer4 -> avgpool -> flatten (no fc)
-    # Bottleneck blocks give a 512*4=2048-dim feature vector (vs 512 for BasicBlock ResNets)
-    class FeatureExtractor(nn.Module):
-        def __init__(self, resnet152_model):
-            super().__init__()
-            self.conv1 = resnet152_model.conv1
-            self.bn1 = resnet152_model.bn1
-            self.relu = resnet152_model.relu
-            self.layer1 = resnet152_model.layer1
-            self.layer2 = resnet152_model.layer2
-            self.layer3 = resnet152_model.layer3
-            self.layer4 = resnet152_model.layer4
-            self.avgpool = resnet152_model.avgpool
-
-        def forward(self, x):
-            x = self.relu(self.bn1(self.conv1(x)))
-            x = self.layer1(x)
-            x = self.layer2(x)
-            x = self.layer3(x)
-            x = self.layer4(x)
-            x = self.avgpool(x)
-            x = torch.flatten(x, 1)  # 2048-dimensional features
-            return x
-
-        def __len__(self):
-            """Support len() for compatibility with some evaluators"""
-            return 2048
-
-    feature_extractor = FeatureExtractor(embedding_model)
-
-    # H100 optimizations for embedding extraction
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    feature_extractor = feature_extractor.to(device)
-
-    # Apply torch.compile for faster inference
-    try:
-        feature_extractor = torch.compile(feature_extractor, mode='reduce-overhead', fullgraph=False)
-        compile_status = "✓ torch.compile enabled"
-    except Exception as e:
-        compile_status = f"⚠ torch.compile failed: {e}"
-
-    feature_extractor.eval()
-
-    # H100-optimized predict: larger batch processing, GPU-resident
-    def embedding_predict(x):
-        device = next(feature_extractor.parameters()).device
-        feature_extractor.eval()
-
-        # Convert numpy to tensor (always float32)
-        if not isinstance(x, torch.Tensor):
-            x = torch.tensor(x, dtype=torch.float32)
-
-        with torch.no_grad():
-            # Keep on GPU, torch.compile handles optimization
-            x = x.to(device)
-            embeddings = feature_extractor.forward(x)
-            # Return as numpy (required by embeddings pipeline)
-            return embeddings.cpu().numpy()
-
-    feature_extractor.predict = embedding_predict
-    print(f"✓ Embedding model loaded (ResNet152, 2048-dim features) {compile_status}")
-    print(f"  Device: {device}")
-    print(f"  Batch processing: 1024 samples/batch with H100 acceleration")
-    return feature_extractor
-
-
-def create_method_evaluators(method_name, seed, embedding_model=None, val_batch_size=128, proportion=0.7, num_models=100, output_base="results", k_neighbors=10, lam_y=5.0, lam_x=1.0, lambda_weight=0.97, valid_chunk=512, row_chunk=8192, sava_batch_size=1024, dist_rand=7.3622, lsh_t=2.399, n_hash_table=100, lsh_eps=1e-2):
+def create_method_evaluators(method_name, seed, embedding_model=None, val_batch_size=128, proportion=0.7, subset_size=None, num_models=100, checkpoint_models=None, lam_y=5.0, lam_x=1.0, k_neighbors=10, lambda_weight=0.97, valid_chunk=512, sava_batch_size=1024, dist_rand=7.3622, lsh_t=2.399, n_hash_table=100, lsh_eps=1e-2):
     """Create evaluators for specified method using unified config."""
     print(f"\n[Methods] Creating {method_name} evaluators...")
 
-    if method_name in ("DataOobCKPT", "DataOob"):
+    if method_name in ("DataOob", "DOOB"):
         evaluators = [
             DataOobCKPT(
                 num_models=num_models,
                 proportion=proportion,
-                checkpoint_models=[1, 5, 10, 50, 100],
+                checkpoint_models=checkpoint_models if checkpoint_models else [1,5,10,50],
                 random_state=seed,
                 verbose=True
             )
         ]
 
-    elif method_name in ("LOO_Random", "Random"):
+    elif method_name == "Random":
         evaluators = [RandomEvaluator(random_state=seed)]
 
+    
     elif method_name == "KNNShapley":
-        evaluators = [
-            KNNShapley(k_neighbors=k_neighbors, embedding_model=embedding_model, random_state=seed)
-        ]
-
-    elif method_name == "KNNShapleyVec":
         evaluators = [
             KNNShapleyVec(k_neighbors=k_neighbors, valid_chunk=valid_chunk, embedding_model=embedding_model, random_state=seed, debug=True)
         ]
 
-    elif method_name == "AKShapleyGPU":
-        # GPU-resident AKShapley. Same LSH approximation as the KNNShapleyLSH
-        # branch below: candidate sets, neighbour order and the label-match
-        # matrix are identical, values agree to ~1 ULP.
-        # eps sets the retrieval depth K_star = max(k_neighbors, ceil(1/eps)):
-        # eps>=1e-3 gives K_star=1000 (so eps does not vary the result once
-        # dist_rand and t are pinned), eps=1e-4 gives K_star=10000.
+    elif method_name == "AKShapley":
         evaluators = [
             AKShapleyGPU(
                 k_neighbors=1000,
@@ -654,51 +579,26 @@ def create_method_evaluators(method_name, seed, embedding_model=None, val_batch_
             )
         ]
 
-    elif method_name == "AKShapley":
-        evaluators = [
-            KNNShapleyLSH(
-                k_neighbors=1000,
-                dist_rand=7.3622,
-                n_hash_table=100,
-                eps=eps,
-                alpha=0.5,
-                t=2.399,
-                embedding_model=embedding_model,
-                random_state=seed
-            )
-            for eps in [1e-3, 1e-2]
-        ]
-
-    elif method_name == "DataShapley":
-        evaluators = [DataShapley(mc_epochs=mc, min_cardinality=5, random_state=seed) for mc in [100]]
-
-    elif method_name == "BetaShapley":
-        evaluators = [BetaShapley(num_models=m, random_state=seed) for m in [100, 500, 1000]]
-
-    elif method_name == "DataBanzhaf":
-        evaluators = [DataBanzhaf(num_models=m, random_state=seed) for m in [100, 500, 1000]]
-
     elif method_name == "InfluenceSubsample":
         evaluators = [
             InfluenceSubsampleCKPT(
                 num_models=100,
-                proportion=proportion,
-                checkpoint_models=[1, 5, 10, 50],
-                random_state=seed,
+                subset_size=subset_size,
+                checkpoint_models=[1, 50, 100],
+                random_state=seed+1,  # Decorelated noise and randomness for reproducibility
                 verbose=True,
             )
         ]
 
-    elif method_name == "AME":
-        evaluators = [AME(num_models=m, random_state=seed) for m in [100000]]
 
     elif method_name == "DVRL":
         evaluators = [DVRL(rl_epochs=e, rl_batch_size=b, random_state=seed) for e in [1000] for b in [20000]]
 
     elif method_name == "LAVA":
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        lava_embedding_model = getattr(embedding_model, "_orig_mod", embedding_model)
         evaluators = [
-            LavaEvaluator(blur=0.05, debug=True, lam_x=lam_x, lam_y=lam_y, embedding_model=embedding_model, random_state=seed, device=device)
+            LavaEvaluator(blur=0.05, debug=True, lam_x=lam_x, lam_y=lam_y, embedding_model=lava_embedding_model, random_state=seed, device=device)
         ]
 
     elif method_name == "SAVA":
@@ -719,19 +619,15 @@ def create_method_evaluators(method_name, seed, embedding_model=None, val_batch_
         ]
 
     elif method_name == "InRunDataShapleyGhost":
-        TRAIN_KWARGS = get_unified_train_kwargs("resnet152")
+        TRAIN_KWARGS = get_unified_train_kwargs("rn9")
         # Use unified scheduler configuration
         scheduler_type = TRAIN_KWARGS.get("scheduler", "cosine")
         scheduler_params = TRAIN_KWARGS.get("scheduler_params", {"step_size": 30, "gamma": 0.1})
 
-        # Construct output directory for InRun debug files
-        gpu_suffix = get_gpu_type_suffix()
-        inrun_output_dir = Path(output_base) / "InRunDataShapleyGhost" / f"val_batch_size_{val_batch_size}" / f"seed_{seed}{gpu_suffix}" / "evaluation"
-
         evaluators = [
             InRunDataShapleyGhost(
                 epochs=TRAIN_KWARGS["epochs"],
-                batch_size=512,  # Match LoGRA Phase 1 batch size
+                batch_size=TRAIN_KWARGS["batch_size"],
                 learning_rate=TRAIN_KWARGS["lr"],
                 weight_decay=TRAIN_KWARGS["weight_decay"],
                 val_batch_size=val_batch_size,
@@ -742,12 +638,11 @@ def create_method_evaluators(method_name, seed, embedding_model=None, val_batch_
                 random_state=seed,
                 verbose=True,
                 save_plots=True,
-                plot_dir=str(inrun_output_dir),
             )
         ]
 
     elif method_name == "LoGRA":
-        TRAIN_KWARGS = get_unified_train_kwargs("resnet152")
+        TRAIN_KWARGS = get_unified_train_kwargs("rn9")
         # Use unified scheduler configuration (cosine or step)
         scheduler_type = TRAIN_KWARGS.get("scheduler", "cosine")
         scheduler_params = TRAIN_KWARGS.get("scheduler_params", {"step_size": 30, "gamma": 0.1})
@@ -755,16 +650,14 @@ def create_method_evaluators(method_name, seed, embedding_model=None, val_batch_
         evaluators = [
             LoGRA(
                 lora="pca",
-                hessian="kfac",  # Changed from ekfac to kfac for memory efficiency on ResNet152
-                epochs=100,  # Full training
-                batch_size=512,  # Training + Phase 1 batch size
+                hessian="kfac",
+                epochs=TRAIN_KWARGS["epochs"],
+                batch_size=TRAIN_KWARGS["batch_size"],
                 learning_rate=TRAIN_KWARGS["lr"],
                 weight_decay=TRAIN_KWARGS["weight_decay"],
                 scheduler_type=scheduler_type,  # Use cosine or step from unified config
                 step_size=scheduler_params.get("step_size", 30),  # For StepLR
                 step_gamma=scheduler_params.get("gamma", 0.1),  # For StepLR (correct parameter name)
-                log_loader_batch_size=1024,  # Reduced evaluation batch size
-                query_batch_size=1024,  # Reduced evaluation batch size
                 random_state=seed,
                 verbose=True
             )
@@ -775,36 +668,19 @@ def create_method_evaluators(method_name, seed, embedding_model=None, val_batch_
             print("⚠ Kairos not available, skipping")
             return []
         evaluators = [
-            Kairos(
-                lambda_weight=0.97,
-                unbiased=True,
-                use_median_heuristic=True,
-                num_samples=10000,
-                embedding_model=embedding_model,
-                random_state=seed,
-                debug=True
-            )
-        ]
-
-    elif method_name == "KairosGPU":
-        if not KAIROS_AVAILABLE:
-            print("⚠ Kairos not available, skipping")
-            return []
-        evaluators = [
             KairosGPU(
-                row_chunk=row_chunk,
                 lambda_weight=lambda_weight,
                 unbiased=True,
                 use_median_heuristic=True,
                 num_samples=10000,
                 embedding_model=embedding_model,
                 random_state=seed,
-                debug=True
+                debug=True,
+                row_chunk=50000
             )
         ]
 
-    elif method_name == "InfluenceFunction":
-        evaluators = [InfluenceFunction()]
+
 
     else:
         raise ValueError(f"Unknown method: {method_name}")
@@ -813,68 +689,24 @@ def create_method_evaluators(method_name, seed, embedding_model=None, val_batch_
     return evaluators
 
 
-def run_evaluations(exper_med, output_dir, skip_remove_high_low_for_checkpoints=None):
+def run_evaluations(exper_med, output_dir):
     """Run all evaluation experiments and save results."""
     print(f"\n[Evaluate] Running evaluations...")
     results_dict = {}
-    skip_remove_high_low_for_checkpoints = skip_remove_high_low_for_checkpoints or []
 
     evaluation_functions = [
         (noisy_detection, "noisy_detection"),
         (discover_corrupted_sample, "discover_corrupted_sample"),
-    ]
-
-    # Identify indices of evaluators to skip for remove_high_low
-    skip_indices = []
-    all_ckpts = []
-    if skip_remove_high_low_for_checkpoints:
-        for idx, ev in enumerate(exper_med.data_evaluators):
-            ev_str = str(ev)
-            if "CKPT@" in ev_str:
-                try:
-                    ckpt_num = int(ev_str.split("@")[1].split("(")[0])
-                    all_ckpts.append(ckpt_num)
-                    if ckpt_num in skip_remove_high_low_for_checkpoints:
-                        skip_indices.append(idx)
-                except (IndexError, ValueError):
-                    pass
-        if skip_indices:
-            skipped = sorted(set([int(str(exper_med.data_evaluators[i]).split("@")[1].split("(")[0]) for i in skip_indices]))
-            to_run = sorted(set([c for c in all_ckpts if c not in skip_remove_high_low_for_checkpoints]))
-            print(f"  [DEBUG] All checkpoints: {sorted(set(all_ckpts))}")
-            print(f"  [DEBUG] Skip list: {skip_remove_high_low_for_checkpoints}")
-            print(f"  [DEBUG] Skipping indices: {skip_indices}")
-            print(f"  [DEBUG] Skipped checkpoints: {skipped}")
-            print(f"  [DEBUG] Will run for: {to_run}")
-            print(f"  ⊘ remove_high_low: Skip {skipped}, run for {to_run}")
-
-    evaluation_functions.append((remove_high_low, "remove_high_low"))
+        (remove_high_low, "remove_high_low")]
 
     for eval_func, eval_name in evaluation_functions:
         try:
-            # For remove_high_low: filter to exclude skipped checkpoints
-            if eval_name == "remove_high_low" and skip_indices:
-                original_evaluators = exper_med.data_evaluators
-                exper_med.data_evaluators = [ev for i, ev in enumerate(original_evaluators) if i not in skip_indices]
-
-                if exper_med.data_evaluators:
-                    result = exper_med.evaluate(eval_func, save_output=True)
-                    results_dict[eval_name] = result
-                    print(f"  ✓ {eval_name}")
-                else:
-                    print(f"  ⊘ remove_high_low: Skipped (all in skip list)")
-                    results_dict[eval_name] = None
-
-                exper_med.data_evaluators = original_evaluators
-            else:
-                result = exper_med.evaluate(eval_func, save_output=True)
-                results_dict[eval_name] = result
-                print(f"  ✓ {eval_name}")
+            result = exper_med.evaluate(eval_func, save_output=True)
+            results_dict[eval_name] = result
+            print(f"  ✓ {eval_name}")
         except Exception as e:
             print(f"  ✗ {eval_name}: {str(e)[:60]}")
             results_dict[eval_name] = None
-            if eval_name == "remove_high_low" and skip_indices:
-                exper_med.data_evaluators = original_evaluators
 
     try:
         exper_med.evaluate(save_dataval, save_output=True)
@@ -901,26 +733,6 @@ def start_profiler_thread(profiler_obj, interval=1.0):
     thread = threading.Thread(target=snapshot_loop, daemon=True)
     thread.start()
     return stop_event, thread
-
-
-def estimate_model_flops(model, input_size=(1, 3, 32, 32)):
-    """Estimate FLOPs for model forward pass (lightweight, no profiler)"""
-    try:
-        total_flops = 0
-        for name, module in model.named_modules():
-            if isinstance(module, nn.Conv2d):
-                # FLOPs = 2 * kernel_h * kernel_w * in_channels * out_channels * output_h * output_w
-                kernel_ops = module.kernel_size[0] * module.kernel_size[1] * (module.in_channels / module.groups)
-                output_size = input_size
-                for _ in range(len(input_size) - 1):
-                    output_size = tuple(map(lambda x: x // module.stride[0] if isinstance(module.stride, tuple) else x // module.stride, output_size[1:]))
-                flops = kernel_ops * module.out_channels * (output_size[0] if len(output_size) > 0 else 1) * (output_size[1] if len(output_size) > 1 else 1)
-                total_flops += flops * 2  # multiply-add
-            elif isinstance(module, nn.Linear):
-                total_flops += 2 * module.in_features * module.out_features
-        return total_flops
-    except:
-        return 0
 
 
 def save_checkpoint_profiles(method_name, output_dir, evaluators):
@@ -1013,8 +825,8 @@ def generate_overall_report(base_output_dir, method_name, seed, model_name,
         }
 
     # Skip file aggregation - CSVs are already in eval directories
-    # File globbing can hang on slow/problematic filesystems
-    summary_data['performance']['note'] = 'CSV files are in eval_*/ directories'
+    # File globbing can hang on slow filesystems
+    summary_data['performance']['note'] = 'CSV files are in eval_*/  directories'
 
     # Generate summary JSON with all metrics
     summary_file = report_dir / f"{method_name}_overall_summary.json"
@@ -1034,23 +846,23 @@ def run_experiment(
     logs_base: str = "./logs",
     val_batch_size: int = 128,
     proportion: float = 0.7,
+    subset_size: int = None,
     num_models: int = 100,
-    train_validation_model: bool = False,
+    checkpoint_models: list = None,
+    lam_y: float = 5.0,
+    lam_x: float = 1.0,
     k_neighbors: int = 10,
-    embedder: str = "resnet9",
     dist_rand: float = 7.3622,
     lsh_t: float = 2.399,
     n_hash_table: int = 100,
     lsh_eps: float = 1e-2,
-    lam_y: float = 5.0,
-    lam_x: float = 1.0,
     lambda_weight: float = 0.97,
+    embedder: str = "resnet9",
     valid_chunk: int = 512,
-    row_chunk: int = 8192,
     sava_batch_size: int = 1024
 ):
     """Run complete H100-optimized data valuation experiment."""
-    timestamp_str = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S") if logs_base == "./logs" else None
+    timestamp_str = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
 
     logger, log_file = setup_logging(method_name, seed, logs_base, timestamp_str)
     tracker = MemoryTracker()
@@ -1080,7 +892,7 @@ def run_experiment(
         logger.warning(f"[GPU] Cache clearing failed: {e}")
 
     logger.info("[Experiment] Creating experiment mediator with H100 optimizations...")
-    exper_med = create_experiment_mediator(model_name, seed, cuda_device, train_validation_model=train_validation_model)
+    exper_med = create_experiment_mediator(model_name, seed, cuda_device)
 
     # Patch InRunDataShapleyGhost for numpy compatibility
     if method_name == "InRunDataShapleyGhost":
@@ -1109,23 +921,21 @@ def run_experiment(
         embedding_model = create_imagenet_embedding_model(renorm=False)
     else:
         embedding_model = create_embedding_model()
-
     logger.info(f"[Methods] Creating {method_name} evaluators...")
-    evaluators = create_method_evaluators(method_name, seed, embedding_model=embedding_model, val_batch_size=val_batch_size, proportion=proportion, num_models=num_models, output_base=output_base, k_neighbors=k_neighbors, lam_y=lam_y, lam_x=lam_x, lambda_weight=lambda_weight, valid_chunk=valid_chunk, row_chunk=row_chunk, sava_batch_size=sava_batch_size, dist_rand=dist_rand, lsh_t=lsh_t, n_hash_table=n_hash_table, lsh_eps=lsh_eps)
+    evaluators = create_method_evaluators(method_name, seed, embedding_model=embedding_model, val_batch_size=val_batch_size, proportion=proportion, subset_size=subset_size, num_models=num_models, checkpoint_models=checkpoint_models, lam_y=lam_y, lam_x=lam_x, k_neighbors=k_neighbors, lambda_weight=lambda_weight, valid_chunk=valid_chunk, sava_batch_size=sava_batch_size, dist_rand=dist_rand, lsh_t=lsh_t, n_hash_table=n_hash_table, lsh_eps=lsh_eps)
 
     # AUTO-ORGANIZE: Extract config from evaluator and create organized path
     def get_organized_output_dir(method_name, evaluators, seed, output_base):
         """Create organized directory structure based on method and config."""
         import re
 
-        gpu_suffix = get_gpu_type_suffix()
         output_base_str = str(output_base)
         # If path already contains method_name and seed_N, use it directly (avoid double nesting)
         if method_name in output_base_str and f"seed_{seed}" in output_base_str:
             return Path(output_base)
 
         if not evaluators:
-            return Path(output_base) / method_name / f"seed_{seed}{gpu_suffix}"
+            return Path(output_base) / method_name / f"seed_{seed}"
 
         ev_str = str(evaluators[0])
 
@@ -1134,11 +944,11 @@ def run_experiment(
             match = re.search(r'val_batch_size=(\d+)', ev_str)
             if match:
                 vbs = match.group(1)
-                return Path(output_base) / "InRunDataShapleyGhost" / f"val_batch_size_{vbs}" / f"seed_{seed}{gpu_suffix}"
+                return Path(output_base) / "InRunDataShapleyGhost" / f"val_batch_size_{vbs}" / f"seed_{seed}"
 
         # LoGRA: flat by seed
         if "LoGRA" in method_name:
-            return Path(output_base) / "LoGRA" / f"seed_{seed}{gpu_suffix}"
+            return Path(output_base) / "LoGRA" / f"seed_{seed}"
 
         # InfSub: already organized (InfSub_m100_p0.2, InfSub_m100_p0.7)
         if "InfSub" in method_name:
@@ -1146,14 +956,10 @@ def run_experiment(
             base_method = method_name.split("_")[0]  # e.g., "InfSub"
             config_suffix = "_".join(method_name.split("_")[1:]) if "_" in method_name else ""
             folder = f"{base_method}_{config_suffix}" if config_suffix else base_method
-            return Path(output_base) / folder / f"seed_{seed}{gpu_suffix}"
+            return Path(output_base) / folder / f"seed_{seed}"
 
         # Default: Method / seed
-        # DataOob: flat by seed
-        if "DataOob" in method_name:
-            return Path(output_base) / "DataOobCKPT" / f"seed_{seed}{gpu_suffix}"
-        return Path(output_base) / method_name / f"seed_{seed}{gpu_suffix}"
-
+        return Path(output_base) / method_name / f"seed_{seed}"
 
     base_output_dir = get_organized_output_dir(method_name, evaluators, seed, output_base)
     base_output_dir.mkdir(parents=True, exist_ok=True)
@@ -1171,7 +977,7 @@ def run_experiment(
         print(f"Output (base): {base_output_dir}")
         print(f"Output (subdirs): {len(output_dirs)} evaluators")
     else:
-        output_dir = base_output_dir / "evaluation"
+        output_dir = base_output_dir / "eval_00_default"
         output_dir.mkdir(parents=True, exist_ok=True)
         exper_med.set_output_directory(str(output_dir))
         print(f"Output: {output_dir}")
@@ -1198,10 +1004,21 @@ def run_experiment(
         print(f"⚠ [Profiler] Failed to create profiler directory: {e}")
         profiler_dir = None
 
-    # Skip profiler to avoid CUDA device locking
-    compute_profiler = None
-    compute_stop_event = None
-    compute_thread = None
+    if PROFILER_AVAILABLE and "LoGRA" not in method_name and profiler_dir:
+        try:
+            compute_profiler = ComprehensiveProfiler(
+                method_name=method_name,
+                output_dir=str(profiler_dir),
+                model=embedding_model,  # Pass embedding model for parameter counting
+                device=f"cuda:{cuda_device}" if torch.cuda.is_available() else "cpu"
+            )
+            compute_profiler.start_profiling()
+            compute_stop_event, compute_thread = start_profiler_thread(compute_profiler, interval=0.5)
+        except Exception as e:
+            print(f"⚠ [Profiler] Failed to initialize compute profiler: {e}")
+            compute_profiler = None
+            compute_stop_event = None
+            compute_thread = None
 
     try:
         exper_med = exper_med.compute_data_values(data_evaluators=evaluators)
@@ -1228,39 +1045,66 @@ def run_experiment(
         except Exception as e:
             print(f"⚠ [Profiler] Failed to join compute profiler thread: {e}")
 
-        # Profiler disabled to avoid CUDA device locking
+        if compute_profiler:
+            try:
+                compute_profiler.end_profiling()
+                # Populate ALL metrics before generating outputs
+                print(f"[Profiler] Collecting metrics for {method_name}...")
+                try:
+                    print(f"  [Step 1/7] get_hardware_stats...", flush=True)
+                    compute_profiler.get_hardware_stats()
+                    print(f"  [Step 2/7] get_timing_stats...", flush=True)
+                    compute_profiler.get_timing_stats()
+                    print(f"  [Step 3/7] get_memory_stats...", flush=True)
+                    compute_profiler.get_memory_stats()
+                    # Get data size from experiment mediator
+                    n_samples = getattr(exper_med, '_train_count', 40000)
+                    print(f"  [Step 4/7] count_flops...", flush=True)
+                    compute_profiler.count_flops(n_samples, 128, 10)
+                    print(f"  [Step 5/7] count_parameters...", flush=True)
+                    compute_profiler.count_parameters()
+                    print(f"  [Step 6/7] estimate_memory_transfer...", flush=True)
+                    compute_profiler.estimate_memory_transfer(n_samples, 128)
+                    print(f"  [Step 7/7] generate_all_outputs...", flush=True)
+                    compute_profiler.generate_all_outputs()
+                    print(f"  ✓ Metrics collected and reports generated")
+                except Exception as e:
+                    print(f"  ⚠ Profiler error (continuing): {e}")
+            except Exception as e:
+                print(f"⚠ [Profiler] Failed to end compute profiler: {e}")
 
     print("[Debug] Ending compute_tracker...", flush=True)
     try:
         compute_stats = compute_tracker.end()
         print(f"[Debug] compute_tracker.end() complete: {compute_stats['elapsed_formatted']}", flush=True)
-
-        # Add lightweight FLOPs estimation
-        try:
-            n_samples = getattr(exper_med, '_train_count', 40000)
-            flops_per_sample = estimate_model_flops() / 1e9  # Billion FLOPs
-            total_flops = flops_per_sample * n_samples / 1e9  # Billion FLOPs
-            compute_stats['flops_billion'] = total_flops
-            print(f"[Debug] Estimated FLOPs: {total_flops:.2f}B")
-        except Exception as e:
-            print(f"⚠ FLOPs estimation failed: {e}")
-            compute_stats['flops_billion'] = 0
     except Exception as e:
         print(f"⚠ [MemoryTracker] Failed to end compute_tracker: {e}")
-        compute_stats = {'elapsed_seconds': 0, 'elapsed_formatted': 'unknown', 'cpu_peak_mb': 0, 'cpu_rss_mb': 0, 'gpu_allocated_mb': 0, 'gpu_reserved_mb': 0, 'gpu_max_allocated_mb': 0, 'flops_billion': 0}
+        compute_stats = {'elapsed_seconds': 0, 'elapsed_formatted': 'unknown', 'cpu_peak_mb': 0, 'cpu_rss_mb': 0, 'gpu_allocated_mb': 0, 'gpu_reserved_mb': 0, 'gpu_max_allocated_mb': 0}
 
     logger.info("[Evaluate] Running evaluations...")
     eval_tracker = MemoryTracker()
     eval_tracker.start()
 
-    # Skip profiler to avoid CUDA device locking
+    # Setup comprehensive profiler for evaluation phase (skip for LoGRA - too many snapshots)
     eval_profiler = None
     eval_stop_event = None
     eval_thread = None
-
-    skip_remove_high_low_for_checkpoints = [1, 5, 10]
-
-    results_dict = run_evaluations(exper_med, str(base_output_dir), skip_remove_high_low_for_checkpoints=skip_remove_high_low_for_checkpoints)
+    if PROFILER_AVAILABLE and "LoGRA" not in method_name and profiler_dir:
+        try:
+            eval_profiler = ComprehensiveProfiler(
+                method_name=f"{method_name}_eval",
+                output_dir=str(profiler_dir),
+                model=embedding_model,  # Pass embedding model for parameter counting
+                device=f"cuda:{cuda_device}" if torch.cuda.is_available() else "cpu"
+            )
+            eval_profiler.start_profiling()
+            eval_stop_event, eval_thread = start_profiler_thread(eval_profiler, interval=0.1)  # Faster for shorter eval phase
+        except Exception as e:
+            print(f"⚠ [Profiler] Failed to initialize eval profiler: {e}")
+            eval_profiler = None
+            eval_stop_event = None
+            eval_thread = None
+    results_dict = run_evaluations(exper_med, str(base_output_dir))
 
     try:
         if eval_stop_event:
@@ -1274,7 +1118,33 @@ def run_experiment(
     except Exception as e:
         print(f"⚠ [Profiler] Failed to join eval profiler thread: {e}")
 
-    # Profiler disabled to avoid CUDA device locking
+    if eval_profiler:
+        try:
+            eval_profiler.end_profiling()
+            # Populate ALL metrics before generating outputs
+            print(f"[Profiler] Collecting metrics for {method_name} (eval phase)...")
+            try:
+                print(f"  [Step 1/7] get_hardware_stats...", flush=True)
+                eval_profiler.get_hardware_stats()
+                print(f"  [Step 2/7] get_timing_stats...", flush=True)
+                eval_profiler.get_timing_stats()
+                print(f"  [Step 3/7] get_memory_stats...", flush=True)
+                eval_profiler.get_memory_stats()
+                # Get data size from experiment mediator
+                n_samples = getattr(exper_med, '_train_count', 40000)
+                print(f"  [Step 4/7] count_flops...", flush=True)
+                eval_profiler.count_flops(n_samples, 128, 10)
+                print(f"  [Step 5/7] count_parameters...", flush=True)
+                eval_profiler.count_parameters()
+                print(f"  [Step 6/7] estimate_memory_transfer...", flush=True)
+                eval_profiler.estimate_memory_transfer(n_samples, 128)
+                print(f"  [Step 7/7] generate_all_outputs...", flush=True)
+                eval_profiler.generate_all_outputs()
+                print(f"  ✓ Metrics collected and reports generated")
+            except Exception as e:
+                print(f"  ⚠ Profiler error (continuing): {e}")
+        except Exception as e:
+            print(f"⚠ [Profiler] Failed to end eval profiler: {e}")
 
     print("[Debug] Ending eval_tracker...", flush=True)
     try:
@@ -1286,36 +1156,45 @@ def run_experiment(
 
     # Save checkpoint profiles for CKPT methods
     logger.info("[Checkpoints] Saving checkpoint profiles...")
-    save_checkpoint_profiles(method_name, base_output_dir, evaluators)
+    try:
+        save_checkpoint_profiles(method_name, base_output_dir, evaluators)
+    except Exception as e:
+        print(f"⚠ [Checkpoints] Failed to save checkpoint profiles: {e}")
 
     # Generate overall report with memory/timing stats
     logger.info("[Report] Generating overall report...")
-    generate_overall_report(
-        base_output_dir,
-        method_name,
-        seed,
-        model_name,
-        compute_stats=compute_stats,
-        eval_stats=eval_stats,
-        num_evaluators=len(evaluators)
-    )
+    try:
+        generate_overall_report(
+            base_output_dir,
+            method_name,
+            seed,
+            model_name,
+            compute_stats=compute_stats,
+            eval_stats=eval_stats,
+            num_evaluators=len(evaluators)
+        )
+    except Exception as e:
+        print(f"⚠ [Report] Failed to generate overall report: {e}")
 
     # Distribute evaluation results
     logger.info("[Distribute] Copying evaluation results to all evaluator directories...")
-    import shutil
-    from glob import glob
+    try:
+        import shutil
+        from glob import glob
 
-    first_eval_dir = Path(output_dirs[0]) if output_dirs else None
-    if first_eval_dir:
-        csv_files = list(first_eval_dir.glob("*.csv"))
-        if csv_files and len(output_dirs) > 1:
-            for idx, target_dir in enumerate(output_dirs[1:], start=1):
-                target_dir = Path(target_dir)
-                for csv_file in csv_files:
-                    try:
-                        shutil.copy2(csv_file, target_dir / csv_file.name)
-                    except Exception as e:
-                        logger.warning(f"Could not copy {csv_file.name} to eval_{idx:02d}: {e}")
+        first_eval_dir = Path(output_dirs[0]) if output_dirs else None
+        if first_eval_dir:
+            csv_files = list(first_eval_dir.glob("*.csv"))
+            if csv_files and len(output_dirs) > 1:
+                for idx, target_dir in enumerate(output_dirs[1:], start=1):
+                    target_dir = Path(target_dir)
+                    for csv_file in csv_files:
+                        try:
+                            shutil.copy2(csv_file, target_dir / csv_file.name)
+                        except Exception as e:
+                            logger.warning(f"Could not copy {csv_file.name} to eval_{idx:02d}: {e}")
+    except Exception as e:
+        print(f"⚠ [Distribute] Failed to distribute CSV results: {e}")
 
     print("[Debug] Ending overall tracker...", flush=True)
     try:
@@ -1337,7 +1216,8 @@ def run_experiment(
             'timestamp': pd.Timestamp.now().isoformat(),
             'h100_optimized': True,
             'unified_config': UNIFIED_CONFIG_AVAILABLE,
-            'output_directory': str(base_output_dir)
+            'output_directory': str(base_output_dir),
+            'measurement_methodology': 'Conference-standard (ICML/NeurIPS/ICLR): incremental consumption relative to baseline'
         },
         'timing': {
             'compute_seconds': compute_stats['elapsed_seconds'],
@@ -1385,11 +1265,6 @@ def run_experiment(
                 'delta_gpu_reserved_mb': eval_stats.get('delta_gpu_reserved_mb', 0),
             },
         },
-        'compute': {
-            'flops_billion': compute_stats.get('flops_billion', 0),
-            'memory_delta_mb': compute_stats.get('delta_gpu_allocated_mb', 0),
-            'time_seconds': compute_stats['elapsed_seconds']
-        }
     }
 
     print("\n" + "=" * 90)
@@ -1492,19 +1367,23 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="resnet152",
-        choices=["rn9", "resnet18", "resnet34", "resnet50", "resnet101", "resnet152", "rn110"],
+        default="rn9",
+        choices=["rn9", "resnet18", "resnet50", "resnet50", "resnet152"],
         help="ResNet model to use (all use identical H100-optimized config)"
     )
     parser.add_argument("--method", type=str, default="LoGRA", help="Data valuation method")
     parser.add_argument("--cuda", type=int, default=0, help="CUDA device ID")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--val_batch_size", type=int, default=128, help="Validation batch size")
-    parser.add_argument("--proportion", type=float, default=0.7, help="Proportion for InfluenceSubsampleCKPT/DataOob")
-    parser.add_argument("--num_models", type=int, default=100, help="Number of models for DataOobCKPT")
+    parser.add_argument("--proportion", type=float, default=0.7, help="Proportion for DataOob")
+    parser.add_argument("--subset_size", type=int, default=None, help="Fixed subset size for InfluenceSubsampleCKPT (overrides proportion)")
     parser.add_argument("--output-base", type=str, default="./results", help="Output base directory")
     parser.add_argument("--logs-base", type=str, default="./logs", help="Logs base directory")
-    parser.add_argument("--train-validation-model", action="store_true", help="Train a model on the validation set and save checkpoints/validation_model/model.pth")
+    parser.add_argument("--num_models", type=int, default=100, help="Number of models for DataOobCKPT")
+    parser.add_argument("--checkpoints", type=str, default=None, help="Comma-separated checkpoint model counts for DataOobCKPT, e.g. 1,5,10")
+    parser.add_argument("--lam_y", type=float, default=5.0, help="lam_y for LAVA")
+    parser.add_argument("--lam_x", type=float, default=1.0, help="lam_x for LAVA")
+    parser.add_argument("--sava_batch_size", type=int, default=1024, help="batch_size for SAVA")
     parser.add_argument("--dist_rand", type=float, default=7.3622,
                         help="AKShapley LSH scale; should be the embeddings' mean "
                              "pairwise distance. <=0 estimates it from data (needs eps<=1/k).")
@@ -1512,16 +1391,14 @@ def main():
     parser.add_argument("--n_hash_table", type=int, default=100, help="AKShapley LSH tables")
     parser.add_argument("--lsh_eps", type=float, default=1e-2,
                         help="AKShapley retrieval depth: K_star = max(k_neighbors, ceil(1/eps))")
-    parser.add_argument("--k_neighbors", type=int, default=10, help="k for KNNShapley/KNNShapleyVec")
-    parser.add_argument("--embedder", type=str, default="resnet9", choices=["resnet9","imagenet","imagenet_raw"], help="which embedding model to use")
-    parser.add_argument("--lam_y", type=float, default=5.0, help="lam_y for LAVA")
-    parser.add_argument("--lam_x", type=float, default=1.0, help="lam_x for LAVA")
-    parser.add_argument("--sava_batch_size", type=int, default=1024, help="batch_size for SAVA")
+    parser.add_argument("--k_neighbors", type=int, default=10, help="k for KNNShapley")
+    parser.add_argument("--embedder", type=str, default="imagenet", help="which embedding model to use")
     parser.add_argument("--lambda_weight", type=float, default=0.97, help="lambda_weight for Kairos")
-    parser.add_argument("--row_chunk", type=int, default=8192, help="rows per pass for KairosGPU (50000 = full GPU, no chunking)")
     parser.add_argument("--valid_chunk", type=int, default=512, help="validation points per batched pass (KNNShapleyVec)")
 
     args = parser.parse_args()
+
+    checkpoint_models = [int(c) for c in args.checkpoints.split(",")] if args.checkpoints else None
 
     # Print H100 optimization info
     print("\n" + "=" * 90)
@@ -1549,20 +1426,20 @@ def main():
         logs_base=args.logs_base,
         val_batch_size=args.val_batch_size,
         proportion=args.proportion,
+        subset_size=args.subset_size,
         num_models=args.num_models,
-        train_validation_model=args.train_validation_model,
+        checkpoint_models=checkpoint_models,
+        lam_y=args.lam_y,
+        lam_x=args.lam_x,
+        sava_batch_size=args.sava_batch_size,
         k_neighbors=args.k_neighbors,
-        embedder=args.embedder,
         dist_rand=args.dist_rand,
         lsh_t=args.lsh_t,
         n_hash_table=args.n_hash_table,
         lsh_eps=args.lsh_eps,
-        lam_y=args.lam_y,
-        lam_x=args.lam_x,
-        sava_batch_size=args.sava_batch_size,
         lambda_weight=args.lambda_weight,
-        valid_chunk=args.valid_chunk,
-        row_chunk=args.row_chunk
+        embedder=args.embedder,
+        valid_chunk=args.valid_chunk
     )
 
 

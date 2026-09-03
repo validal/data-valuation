@@ -2,7 +2,7 @@
 """
 H100-Optimized CIFAR10 + ResNet Data Valuation Experiment (Unified Pipeline)
 
-This is the unified training pipeline for ALL ResNet models (9, 18, 34, 50, 110).
+This is the training pipeline for ResNet9
 All models use identical H100-optimized training hyperparameters for fair comparison.
 
 Key H100 Optimizations:
@@ -23,8 +23,8 @@ Usage Examples:
   # ResNet-50 with full evaluation
   python run_cifar10_resnet9_dataval.py --model resnet50 --cuda 0 --seed 42 --method ALL
   
-  # ResNet-110 with InRunDataShapleyGhost
-  python run_cifar10_resnet9_dataval.py --model rn110 --cuda 0 --seed 42 --method InRunDataShapleyGhost
+  # ResNet152 with InRunDataShapleyGhost
+  python run_cifar10_resnet9_dataval.py --model resnet152 --cuda 0 --seed 42 --method InRunDataShapleyGhost
 
 Updated: 2026-07-29
 Scalability Study: Fair comparison across model depths with H100 optimizations
@@ -46,7 +46,6 @@ import json
 import sys
 import logging
 import psutil
-import tracemalloc
 import threading
 from typing import Optional, Dict, Any
 
@@ -74,14 +73,12 @@ except ImportError:
 from opendataval.dataloader import mix_labels
 from opendataval.dataval import (
     AME, DVRL, BetaShapley, DataBanzhaf, DataOob, DataShapley,
-    InfluenceSubsample, KNNShapley, LeaveOneOut, RandomEvaluator,
+    InfluenceSubsample, KNNShapley, RandomEvaluator,
     LoGRA, InfluenceFunction, InRunDataShapleyGhost
 )
-from opendataval.dataval.knnshap import KNNShapleyLSH, KNNShapleyVec, AKShapleyGPU
 from opendataval.dataval.lava import LavaEvaluator, SavaEvaluator
 from opendataval.dataval.influence.infsub_ckpt import InfluenceSubsampleCKPT
 from opendataval.dataval.oob.dataoob_ckpt import DataOobCKPT
-from opendataval.dataval.influence.inrun_shapley_ckpt import InRunShapleyCKPT
 from opendataval.experiment import ExperimentMediator
 from opendataval.experiment.exper_methods import (
     discover_corrupted_sample, noisy_detection, remove_high_low, save_dataval
@@ -144,21 +141,17 @@ def mix_labels_and_print_distribution(
 
 # Optional imports
 try:
-    from opendataval.dataval.kairos.bkairos import bKairos
-    from opendataval.dataval.kairos.kairos import Kairos
     from opendataval.dataval.kairos.kairosgpu import KairosGPU
     KAIROS_AVAILABLE = True
 except (ImportError, AttributeError):
     KAIROS_AVAILABLE = False
 
 try:
-    from ghostEngines import GradDotProdEngine
     GHOSTENGINES_AVAILABLE = True
 except ImportError:
     GHOSTENGINES_AVAILABLE = False
 
 try:
-    import logix
     LOGIX_AVAILABLE = True
 except ImportError:
     LOGIX_AVAILABLE = False
@@ -487,7 +480,6 @@ def create_experiment_mediator(
         train_kwargs=TRAIN_KWARGS,
         model_name=model_name,
         metric_name=metric_name,
-        train_validation_model=False,
         train_baseline_model=False,  # ✅ Train baseline ResNet at the beginning
         random_state=seed,
         device=device
@@ -497,55 +489,6 @@ def create_experiment_mediator(
     # Store data size for profiling
     exper_med._train_count = train_count
     return exper_med
-
-
-def create_embedding_model():
-    """Create H100-optimized embedding model with feature extraction."""
-    from opendataval.model.resnet import ResNet9
-
-    embedding_model = ResNet9(num_classes=10)
-    embedding_model.load_state_dict(
-        torch.load("./checkpoints/validation_model/model.pth", map_location="cpu")
-    )
-
-    embedding_model.model[9] = nn.Identity()
-    embedding_model.model[10] = nn.Identity()
-
-    # H100 optimizations for embedding extraction
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    embedding_model = embedding_model.to(device)
-
-    # Apply torch.compile for faster inference
-    try:
-        embedding_model = torch.compile(embedding_model, mode='reduce-overhead', fullgraph=False)
-        compile_status = "✓ torch.compile enabled"
-    except Exception as e:
-        compile_status = f"⚠ torch.compile failed: {e}"
-
-    embedding_model.eval()
-
-    # H100-optimized predict: larger batch processing, GPU-resident
-    def embedding_predict(x):
-        device = next(embedding_model.parameters()).device
-        embedding_model.eval()
-
-        # Convert numpy to tensor (always float32)
-        if not isinstance(x, torch.Tensor):
-            x = torch.tensor(x, dtype=torch.float32)
-
-        with torch.no_grad():
-            # Keep on GPU, torch.compile handles optimization
-            x = x.to(device)
-            embeddings = embedding_model.forward(x)
-            # Return as numpy (required by embeddings pipeline)
-            return embeddings.cpu().numpy()
-
-    embedding_model.predict = embedding_predict
-    print(f"✓ Embedding model loaded (ResNet9, 128-dim) {compile_status}")
-    print(f"  Device: {device}")
-    print(f"  Batch processing: 1024 samples/batch with H100 acceleration")
-    return embedding_model
-
 
 
 def create_imagenet_embedding_model(device=None, renorm=True):
@@ -611,26 +554,16 @@ def create_method_evaluators(method_name, seed, embedding_model=None, val_batch_
             )
         ]
 
-    elif method_name == "LOO_Random":
+    elif method_name == "Random":
         evaluators = [RandomEvaluator(random_state=seed)]
 
+    
     elif method_name == "KNNShapley":
-        evaluators = [
-            KNNShapley(k_neighbors=k_neighbors, embedding_model=embedding_model, random_state=seed)
-        ]
-
-    elif method_name == "KNNShapleyVec":
         evaluators = [
             KNNShapleyVec(k_neighbors=k_neighbors, valid_chunk=valid_chunk, embedding_model=embedding_model, random_state=seed, debug=True)
         ]
 
-    elif method_name == "AKShapleyGPU":
-        # GPU-resident AKShapley. Same LSH approximation as the KNNShapleyLSH
-        # branch below: candidate sets, neighbour order and the label-match
-        # matrix are identical, values agree to ~1 ULP.
-        # eps sets the retrieval depth K_star = max(k_neighbors, ceil(1/eps)):
-        # eps>=1e-3 gives K_star=1000 (so eps does not vary the result once
-        # dist_rand and t are pinned), eps=1e-4 gives K_star=10000.
+    elif method_name == "AKShapley":
         evaluators = [
             AKShapleyGPU(
                 k_neighbors=1000,
@@ -646,53 +579,23 @@ def create_method_evaluators(method_name, seed, embedding_model=None, val_batch_
             )
         ]
 
-    elif method_name == "AKShapley":
-        evaluators = [
-            KNNShapleyLSH(
-                k_neighbors=1000,
-                dist_rand=7.3622,
-                n_hash_table=100,
-                eps=eps,
-                alpha=0.5,
-                t=2.399,
-                embedding_model=embedding_model,
-                random_state=seed
-            )
-            for eps in [1e-3, 1e-2]
-        ]
-
-    elif method_name == "DataShapley":
-        evaluators = [DataShapley(mc_epochs=mc, min_cardinality=5, random_state=seed) for mc in [100]]
-
-    elif method_name == "BetaShapley":
-        evaluators = [BetaShapley(num_models=m, random_state=seed) for m in [100, 500, 1000]]
-
-    elif method_name == "DataBanzhaf":
-        evaluators = [DataBanzhaf(num_models=m, random_state=seed) for m in [100, 500, 1000]]
-
     elif method_name == "InfluenceSubsample":
         evaluators = [
             InfluenceSubsampleCKPT(
                 num_models=100,
                 subset_size=subset_size,
                 checkpoint_models=[1, 50, 100],
-                random_state=seed+1,  # Decorelated: fetcher uses seed, method uses seed+1 to prevent leakage
+                random_state=seed+1,  # Decorelated noise and randomness for reproducibility
                 verbose=True,
             )
         ]
 
-    elif method_name == "AME":
-        evaluators = [AME(num_models=m, random_state=seed) for m in [100000]]
 
     elif method_name == "DVRL":
         evaluators = [DVRL(rl_epochs=e, rl_batch_size=b, random_state=seed) for e in [1000] for b in [20000]]
 
     elif method_name == "LAVA":
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        # lava.py:162 does a bare truthiness check on embedding_model. A torch.compile'd
-        # OptimizedModule forwards __len__ to the wrapped module, and ResNet9 has no
-        # __len__, so bool() raises TypeError and opendataval silently drops the
-        # evaluator (empty CSVs). Pass the uncompiled module instead.
         lava_embedding_model = getattr(embedding_model, "_orig_mod", embedding_model)
         evaluators = [
             LavaEvaluator(blur=0.05, debug=True, lam_x=lam_x, lam_y=lam_y, embedding_model=lava_embedding_model, random_state=seed, device=device)
@@ -765,22 +668,6 @@ def create_method_evaluators(method_name, seed, embedding_model=None, val_batch_
             print("⚠ Kairos not available, skipping")
             return []
         evaluators = [
-            Kairos(
-                lambda_weight=lambda_weight,
-                unbiased=True,
-                use_median_heuristic=True,
-                num_samples=10000,
-                embedding_model=embedding_model,
-                random_state=seed,
-                debug=True
-            )
-        ]
-
-    elif method_name == "KairosGPU":
-        if not KAIROS_AVAILABLE:
-            print("⚠ Kairos not available, skipping")
-            return []
-        evaluators = [
             KairosGPU(
                 lambda_weight=lambda_weight,
                 unbiased=True,
@@ -793,8 +680,7 @@ def create_method_evaluators(method_name, seed, embedding_model=None, val_batch_
             )
         ]
 
-    elif method_name == "InfluenceFunction":
-        evaluators = [InfluenceFunction()]
+
 
     else:
         raise ValueError(f"Unknown method: {method_name}")
@@ -803,48 +689,15 @@ def create_method_evaluators(method_name, seed, embedding_model=None, val_batch_
     return evaluators
 
 
-def run_evaluations(exper_med, output_dir, skip_remove_high_low_for_checkpoints=None, force_skip_remove_high_low=False):
+def run_evaluations(exper_med, output_dir):
     """Run all evaluation experiments and save results."""
     print(f"\n[Evaluate] Running evaluations...")
     results_dict = {}
-    skip_remove_high_low_for_checkpoints = skip_remove_high_low_for_checkpoints or []
 
     evaluation_functions = [
         (noisy_detection, "noisy_detection"),
         (discover_corrupted_sample, "discover_corrupted_sample"),
-    ]
-
-    # Check if remove_high_low should be skipped for checkpoints
-    should_skip_remove_high_low = False
-    if force_skip_remove_high_low:
-        should_skip_remove_high_low = True
-        print(f"  ⊘ remove_high_low: Skipped unconditionally (--skip-remove-high-low)")
-    elif skip_remove_high_low_for_checkpoints:
-        # Check if all data evaluators are CKPT checkpoints and all match skip list
-        ckpt_eval_indices = []
-        for idx, ev in enumerate(exper_med.data_evaluators):
-            ev_str = str(ev)
-            if "CKPT@" in ev_str:
-                # Extract checkpoint number from evaluator repr (e.g., "DataOobCKPT@1" -> 1)
-                try:
-                    ckpt_num = int(ev_str.split("@")[1].split("(")[0])
-                    ckpt_eval_indices.append((idx, ckpt_num))
-                except (IndexError, ValueError):
-                    pass
-
-        # Only skip if ALL checkpoint evaluators are in the skip list
-        if ckpt_eval_indices:
-            all_checkpoints = [ckpt for _, ckpt in ckpt_eval_indices]
-            should_skip_remove_high_low = all(ckpt in skip_remove_high_low_for_checkpoints for ckpt in all_checkpoints)
-
-            if should_skip_remove_high_low:
-                print(f"  ⊘ remove_high_low: Skipped (all checkpoints {all_checkpoints} in skip list {skip_remove_high_low_for_checkpoints})")
-            elif any(ckpt in skip_remove_high_low_for_checkpoints for ckpt in all_checkpoints):
-                print(f"  ℹ remove_high_low: Running for all checkpoints (not all in skip list {skip_remove_high_low_for_checkpoints})")
-
-    # Add remove_high_low only if not skipping
-    if not should_skip_remove_high_low:
-        evaluation_functions.append((remove_high_low, "remove_high_low"))
+        (remove_high_low, "remove_high_low")]
 
     for eval_func, eval_name in evaluation_functions:
         try:
@@ -996,7 +849,6 @@ def run_experiment(
     subset_size: int = None,
     num_models: int = 100,
     checkpoint_models: list = None,
-    skip_remove_high_low: bool = False,
     lam_y: float = 5.0,
     lam_x: float = 1.0,
     k_neighbors: int = 10,
@@ -1252,9 +1104,7 @@ def run_experiment(
             eval_profiler = None
             eval_stop_event = None
             eval_thread = None
-
-    skip_remove_high_low_for_checkpoints = [1,5,50]
-    results_dict = run_evaluations(exper_med, str(base_output_dir), skip_remove_high_low_for_checkpoints=skip_remove_high_low_for_checkpoints, force_skip_remove_high_low=skip_remove_high_low)
+    results_dict = run_evaluations(exper_med, str(base_output_dir))
 
     try:
         if eval_stop_event:
@@ -1518,7 +1368,7 @@ def main():
         "--model",
         type=str,
         default="rn9",
-        choices=["rn9", "resnet18", "resnet34", "resnet50", "rn110"],
+        choices=["rn9", "resnet18", "resnet50", "resnet50", "resnet152"],
         help="ResNet model to use (all use identical H100-optimized config)"
     )
     parser.add_argument("--method", type=str, default="LoGRA", help="Data valuation method")
@@ -1531,7 +1381,6 @@ def main():
     parser.add_argument("--logs-base", type=str, default="./logs", help="Logs base directory")
     parser.add_argument("--num_models", type=int, default=100, help="Number of models for DataOobCKPT")
     parser.add_argument("--checkpoints", type=str, default=None, help="Comma-separated checkpoint model counts for DataOobCKPT, e.g. 1,5,10")
-    parser.add_argument("--skip-remove-high-low", action="store_true", help="Skip the remove_high_low evaluation entirely")
     parser.add_argument("--lam_y", type=float, default=5.0, help="lam_y for LAVA")
     parser.add_argument("--lam_x", type=float, default=1.0, help="lam_x for LAVA")
     parser.add_argument("--sava_batch_size", type=int, default=1024, help="batch_size for SAVA")
@@ -1543,7 +1392,7 @@ def main():
     parser.add_argument("--lsh_eps", type=float, default=1e-2,
                         help="AKShapley retrieval depth: K_star = max(k_neighbors, ceil(1/eps))")
     parser.add_argument("--k_neighbors", type=int, default=10, help="k for KNNShapley")
-    parser.add_argument("--embedder", type=str, default="resnet9", choices=["resnet9","imagenet","imagenet_raw"], help="which embedding model to use")
+    parser.add_argument("--embedder", type=str, default="imagenet", help="which embedding model to use")
     parser.add_argument("--lambda_weight", type=float, default=0.97, help="lambda_weight for Kairos")
     parser.add_argument("--valid_chunk", type=int, default=512, help="validation points per batched pass (KNNShapleyVec)")
 
@@ -1580,7 +1429,6 @@ def main():
         subset_size=args.subset_size,
         num_models=args.num_models,
         checkpoint_models=checkpoint_models,
-        skip_remove_high_low=args.skip_remove_high_low,
         lam_y=args.lam_y,
         lam_x=args.lam_x,
         sava_batch_size=args.sava_batch_size,

@@ -1,28 +1,19 @@
 # run_hepmass_dataval_100K.py
 import numpy as np
 import pandas as pd
-from matplotlib import pyplot as plt
-from typing import Optional, Union, List, Dict
-import json
 import os
 import sys
-from pathlib import Path
 import argparse
 import time
-from sklearn.utils import check_random_state
 from sklearn.preprocessing import StandardScaler
 
 # Ensure dataset registry (in case of fresh session)
-import opendataval.dataloader.datasets  # triggers @Register decorators
-from opendataval.dataval.kairos.bkairos import bKairos
 
-from opendataval.dataloader import mix_labels, add_gauss_noise, DataFetcher
+from opendataval.dataloader import DataFetcher
 from opendataval.dataval import (
     AME, DVRL, BetaShapley, DataBanzhaf, DataOob, DataShapley,
-    InfluenceSubsample, KNNShapley, LavaEvaluator, LeaveOneOut, RandomEvaluator,
-    InRunDataShapleyGhost, LoGRA, Kairos
-)
-from opendataval.dataval.influence import LossEvaluator
+    InfluenceSubsample, KNNShapley, LavaEvaluator, RandomEvaluator,
+    InRunDataShapleyGhost, LoGRA)
 from opendataval.dataval.knnshap import KNNShapleyLSH
 from opendataval.experiment import ExperimentMediator
 from opendataval.experiment.exper_methods import (
@@ -35,13 +26,11 @@ from sklearn.utils import shuffle
 
 # GhostSuite and LogIX imports
 try:    
-    from ghostEngines import GradDotProdEngine
     print("✓ GhostSuite import OK")
 except ImportError:
     print("⚠ GhostSuite not available (optional for InRunDataShapleyGhost)")
 
 try:
-    import logix
     print("✓ LogIX import OK")
 except ImportError:
     print("⚠ LogIX not available (optional for LoGRA)")
@@ -74,9 +63,6 @@ except ImportError:
 # # DataBanzhaf - Banzhaf value approximation
 # evaluators.append(DataBanzhaf(num_models=1000, random_state=42))
 #
-# # LeaveOneOut - Exact leave-one-out valuation
-# evaluators.append(LeaveOneOut())
-#
 # # RandomEvaluator - Random baseline
 # evaluators.append(RandomEvaluator(random_state=42))
 #
@@ -89,12 +75,9 @@ except ImportError:
 #
 # # DVRL - Data Valuation using Reinforcement Learning
 # evaluators.append(DVRL(rl_epochs=1000, rl_batch_size=32, random_state=42))
-#
-# # LossEvaluator - Simple Loss-Based Data Valuation Baseline
 # # Trains one model to convergence, values each point as negative loss
 # # High-value points = low loss (clean samples)
 # # Low-value points = high loss (noisy/hard samples)
-# evaluators.append(LossEvaluator(epochs=10, batch_size=32, learning_rate=0.01,
 #                                  verbose=True))
 #
 # # LavaEvaluator - Label-aware Shapley with feature importance
@@ -122,11 +105,10 @@ parser = argparse.ArgumentParser(description='Run HEPMASS 100K data valuation ex
 parser.add_argument('--seed', type=int, default=42, help='Random seed for the experiment')
 parser.add_argument('--method', type=str, required=True,
                    choices=['DataOob', 'AME', 'DataBanzhaf', 'DataShapley',
-                           'InfluenceSubsample', 'LOO_Random', 'KNNShapley', 'AKShapley',
+                           'InfluenceSubsample', 'KNNShapley', 'AKShapley',
                            'DVRL', 'BetaShapley', 'LAVA', 'SAVA', 'InRunDataShapleyGhost',
-                           'LoGRA', 'Kairos', 'LossEvaluator', 'ALL'],
+                           'LoGRA', 'Kairos', 'ALL'],
                    help='Method to run (or ALL for all methods)')
-parser.add_argument('--job_id', type=int, default=1, help='Job ID for naming outputs')
 parser.add_argument(
     "--lam_y",
     type=float,
@@ -138,14 +120,11 @@ args = parser.parse_args()
 # Set seeds
 SEED = args.seed
 METHOD = args.method
-JOB_ID = args.job_id
 LAM_Y = args.lam_y
 
 print(f"Running experiment with:")
 print(f"  - SEED: {SEED}")
 print(f"  - METHOD: {METHOD}")
-print(f"  - JOB_ID: {JOB_ID}")
-
 
 def set_global_seeds(seed):
     """
@@ -162,7 +141,6 @@ def set_global_seeds(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     print(f"[Seeding] ✓ Global seeds configured for reproducibility")
-
 
 def load_and_prepare_hepmass():
     """Load HEPMASS 100K datasets and prepare them for the experiment."""
@@ -238,7 +216,6 @@ def load_and_prepare_hepmass():
     
     return X_train_np, y_train_onehot, X_valid_np, y_valid_onehot, X_test_np, y_test_onehot
 
-
 def create_experiment_mediator():
     """Create and configure the ExperimentMediator for HEPMASS 100K.
 
@@ -252,7 +229,7 @@ def create_experiment_mediator():
 
     # ✅ STEP 2: Load and prepare data (uses seeded RNG)
     X_train, y_train, X_valid, y_valid, X_test, y_test = load_and_prepare_hepmass()
-    X_train, y_train = shuffle(X_train, y_train, random_state=42)
+
     num_classes = y_train.shape[1]
 
     # ✅ STEP 3: Create the fetcher with seed
@@ -322,7 +299,6 @@ def create_experiment_mediator():
 
     return exper_med
 
-
 def create_method_evaluators(method_name, output_dir=None):
     """Create evaluators for a specific method."""
     print(f"Creating evaluators for method: {method_name}")
@@ -340,11 +316,6 @@ def create_method_evaluators(method_name, output_dir=None):
             for s in [SEED]
             ]
         
-    elif method_name == "LOO_Random":
-        evaluators = [
-            RandomEvaluator(random_state=s) for s in [SEED]
-        ]
-
     elif method_name == "KNNShapley":
         evaluators = []
         for rs in [SEED]:
@@ -396,11 +367,7 @@ def create_method_evaluators(method_name, output_dir=None):
                         num_models=m,
                         #proportion=0.7,
                         subset_size=16,
-                        # +1 so this evaluator's own subsample RNG doesn't
-                        # reuse the exact seed passed to noisify()'s
-                        # rng=SEED (confirmed leak across Hep1K/Adult/
-                        # CIFAR10/Connect4/DogFish/Hep10K: RandomState(seed)
-                        # .choice(N,K,replace=False) is deterministic).
+                        # +1 noise seed is not method seed
                         random_state=s + 1,
                         verbose=True
                     )
@@ -487,9 +454,8 @@ def create_method_evaluators(method_name, output_dir=None):
         # ONE evaluator - kernels computed once, lambda tuned later
         evaluators = [
             bKairos(
-                lambda_weight=0.97,              # ✅ Default (will test multiple lambdas)
-                unbiased=True,                   # ✅ Unbiased computation
-                use_median_heuristic=True,       # ✅ Auto-estimate σ
+                lambda_weight=0.97,              
+                unbiased=True,                   # ✅ Auto-estimate σ
                 num_samples=10000,               # ✅ Samples for σ estimation
                 batch_size=1024,                 # ✅ EXTRA: Memory-efficient batching
                 random_state=SEED,               # ✅ Random seed
@@ -497,23 +463,10 @@ def create_method_evaluators(method_name, output_dir=None):
             )
         ]
 
-    elif method_name == "LossEvaluator":
-        EPOCH = 5
-        BATCH_SIZE = 1024
-        evaluators = [
-            LossEvaluator(
-                epochs=EPOCH,
-                batch_size=BATCH_SIZE,
-                learning_rate=0.001,
-                verbose=True
-            )
-            for s in [SEED]
-        ]
-
     elif method_name == "ALL":
         # Combine all methods (for testing)
         evaluators = []
-        for m in ["LOO_Random"]:
+        for m in []:
             evaluators.extend(create_method_evaluators(m, output_dir))
 
     else:
@@ -521,7 +474,6 @@ def create_method_evaluators(method_name, output_dir=None):
 
     print(f"Created {len(evaluators)} evaluators for {method_name}")
     return evaluators
-
 
 def save_time_memory_report(exper_med, output_dir, method_name):
     """Save time and memory report for all evaluators."""
@@ -600,7 +552,6 @@ def save_time_memory_report(exper_med, output_dir, method_name):
     
     return rows
 
-
 def run_method_experiment(method_name):
     """Run experiment for a specific method."""
     print("=" * 70)
@@ -616,7 +567,7 @@ def run_method_experiment(method_name):
     base_remote_dir = (
         f"/home/mehdi.touil/lustre/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/Fine_grained_valuation/Revision/Hep100K/results"
     )
-    output_dir = os.path.join(base_remote_dir, method_name, f'SEED{SEED}_JOB{JOB_ID}')
+    output_dir = os.path.join(base_remote_dir, method_name, f'SEED{SEED}')
 
     os.makedirs(output_dir, exist_ok=True)
     exper_med.set_output_directory(output_dir)
@@ -648,7 +599,7 @@ def run_method_experiment(method_name):
     # Special handling for Kairos: evaluate each lambda (kernel reuse)
     if method_name == "Kairos":
         import time as time_module
-        LAMBDA_VALUES = [0, 0.5, 0.9, 0.95, 0.97, 0.99, 1]
+        LAMBDA_VALUES = [0, 0.5, 0.8, 0.9, 0.97, 1.0]
         evaluator = all_evaluators[0]
         base_output_dir = output_dir
         lambda_timing_results = []
@@ -738,7 +689,6 @@ def run_method_experiment(method_name):
         f.write("=" * 50 + "\n")
         f.write(f"Method: {method_name}\n")
         f.write(f"Seed: {SEED}\n")
-        f.write(f"Job ID: {JOB_ID}\n")
         f.write(f"Completion Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Total Time: {int(hours)}h {int(minutes)}m {seconds:.1f}s\n")
         f.write(f"Output Directory: {output_dir}\n")
@@ -752,188 +702,12 @@ def run_method_experiment(method_name):
     
     return exper_med
 
-
-def generate_shell_scripts():
-    """Generate shell scripts (.sh) that will create and submit SLURM jobs."""
-    print("=" * 70)
-    print("GENERATING SHELL SCRIPTS (.sh) FOR SLURM JOB CREATION")
-    print("=" * 70)
-    
-    # Define all methods
-    methods = [
-        'DataOob', 'AME', 'DataBanzhaf', 'DataShapley',
-        'InfluenceSubsample', 'LOO_Random', 'KNNShapley', 'AKShapley',
-        'DVRL', 'BetaShapley', 'LAVA', 'SAVA', 'InRunDataShapleyGhost',
-        'LoGRA', 'Kairos', 'LossEvaluator'
-    ]
-    
-    # Define paths
-    base_dir = "/home/mehdi.touil/lustre/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/Fine_grained_valuation/Revision/Hep100K"
-    scripts_dir = os.path.join(base_dir, "scripts")
-    logs_dir = os.path.join(base_dir, "logs")
-    
-    os.makedirs(scripts_dir, exist_ok=True)
-    os.makedirs(logs_dir, exist_ok=True)
-    
-    print(f"Base directory: {base_dir}")
-    print(f"Scripts directory: {scripts_dir}")
-    print(f"Logs directory: {logs_dir}")
-    
-    # Define seed ranges for different methods
-    seed_ranges = {
-        'DataOob': list(range(40, 50)),
-        'AME': list(range(40, 50)),
-        'DataBanzhaf': list(range(40, 50)),
-        'DataShapley': list(range(40, 50)),
-        'InfluenceSubsample': list(range(40, 50)),
-        'LOO_Random': list(range(40, 50)),
-        'KNNShapley': list(range(40, 50)),
-        'AKShapley': list(range(40, 50)),
-        'DVRL': list(range(40, 50)),
-        'BetaShapley': list(range(40, 50)),
-        'LAVA': list(range(40, 50)),
-        'SAVA': list(range(40, 50)),
-        'InRunDataShapleyGhost': list(range(40, 50)),
-        'LoGRA': list(range(40, 50)),
-        'Kairos': list(range(40, 50)),
-        'LossEvaluator': list(range(40, 50))
-    }
-    
-    # Create master submission script
-    master_script_path = os.path.join(scripts_dir, "submit_all_methods.sh")
-    with open(master_script_path, 'w') as f:
-        f.write("#!/bin/bash\n")
-        f.write("# Master script to submit all HEPMASS data valuation jobs\n\n")
-        f.write(f"SCRIPTS_DIR=\"{scripts_dir}\"\n\n")
-        f.write("echo \"Submitting all method scripts...\"\n\n")
-        f.write("for script in ${SCRIPTS_DIR}/run_hepmass_*.sh; do\n")
-        f.write("    if [ -f \"$script\" ]; then\n")
-        f.write("        echo \"Submitting: $script\"\n")
-        f.write("        bash \"$script\"\n")
-        f.write("        sleep 0.5\n")
-        f.write("    fi\n")
-        f.write("done\n\n")
-        f.write("echo \"All jobs submitted!\"\n")
-    
-    os.chmod(master_script_path, 0o755)
-    print(f"Created master script: {master_script_path}")
-    
-    # Generate individual shell scripts for each method
-    for method in methods:
-        seeds = seed_ranges.get(method, list(range(40, 50)))
-        print(f"\nGenerating shell script for {method} with seeds {seeds[0]}-{seeds[-1]}")
-        
-        # Create shell script that will generate and submit SLURM scripts
-        shell_script_path = os.path.join(scripts_dir, f"run_hepmass_{method}.sh")
-        
-        with open(shell_script_path, 'w') as f:
-            f.write("#!/bin/bash\n")
-            f.write(f"# Shell script to generate and submit SLURM jobs for {method}\n")
-            f.write(f"# This script creates .slurm files and submits them\n\n")
-            
-            f.write(f"BASE_DIR=\"{base_dir}\"\n")
-            f.write(f"LOGS_BASE=\"{logs_dir}\"\n")
-            f.write(f"METHOD=\"{method}\"\n\n")
-            
-            f.write("# Loop over seeds\n")
-            for seed in seeds:
-                # Create seed-specific log directory
-                f.write(f"SEED={seed}\n")
-                f.write(f"mkdir -p \"${{LOGS_BASE}}/seed${{SEED}}\"\n\n")
-                
-                # Determine environment setup
-                if method in ['InRunDataShapleyGhost', 'LoGRA', 'Kairos']:
-                    env_setup = """# Activate Python 3.12 virtual environment (GhostSuite)
-source ~/ghost_env/.venv/bin/activate
-python --version
-"""
-                else:
-                    env_setup = """# Activate Python 3.9 conda environment
-conda activate py39_env
-python --version
-"""
-                
-                # Create SLURM script
-                f.write(f"cat > ${{BASE_DIR}}/scripts/run_hepmass_{method}_seed${{SEED}}.slurm << SLURM_SCRIPT\n")
-                f.write("#!/bin/bash\n")
-                f.write("#SBATCH --nodes=1\n")
-                f.write("#SBATCH --ntasks=1\n")
-                f.write("#SBATCH --cpus-per-task=56\n")
-                f.write(f"#SBATCH --output=${{LOGS_BASE}}/seed${{SEED}}/run_hepmass_{method}_%j_seed${{SEED}}.log\n")
-                f.write(f"#SBATCH --error=${{LOGS_BASE}}/seed${{SEED}}/run_hepmass_{method}_%j_seed${{SEED}}.err\n")
-                f.write("#SBATCH --time=36:00:00\n")
-                f.write(f"#SBATCH --job-name=hepmass_{method}_seed${{SEED}}\n\n")
-                
-                f.write("# ---------------------------------\n")
-                f.write("# Environment setup\n")
-                f.write("# ---------------------------------\n")
-                f.write("export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK\n")
-                f.write("export PYTHONUNBUFFERED=1\n\n")
-                
-                f.write("source ~/.bashrc\n\n")
-                f.write("# Deactivate any existing environment\n")
-                f.write("conda deactivate 2>/dev/null || true\n")
-                f.write(env_setup)
-                f.write("\n")
-                
-                f.write("# ---------------------------------\n")
-                f.write("# Move to script directory\n")
-                f.write("# ---------------------------------\n")
-                f.write(f"cd \"${{BASE_DIR}}\"\n\n")
-                
-                f.write("# ---------------------------------\n")
-                f.write("# Run Python script for specific method\n")
-                f.write("# ---------------------------------\n")
-                f.write(f"echo \"Starting HEPMASS 100K experiment for method: {method}\"\n")
-                f.write("echo \"Job ID: $SLURM_JOB_ID\"\n")
-                f.write("echo \"Start time: $(date)\"\n")
-                f.write("echo \"Seed: $SEED\"\n\n")
-                
-                f.write(f"python ${{BASE_DIR}}/run_hepmass_dataval_100K.py --seed ${{SEED}} --method {method} --job_id $SLURM_JOB_ID\n\n")
-                
-                f.write("# ---------------------------------\n")
-                f.write("# Completion message\n")
-                f.write("# ---------------------------------\n")
-                f.write(f"echo \"Job completed for method: {method}\"\n")
-                f.write("echo \"End time: $(date)\"\n")
-                f.write("echo \"Job ID: $SLURM_JOB_ID completed successfully\"\n\n")
-                
-                f.write("# Clean up environment\n")
-                f.write("conda deactivate 2>/dev/null || true\n")
-                f.write("SLURM_SCRIPT\n\n")
-                
-                # Submit the SLURM script
-                f.write(f"# Submit the job\n")
-                f.write(f"sbatch ${{BASE_DIR}}/scripts/run_hepmass_{method}_seed${{SEED}}.slurm\n\n")
-                f.write("# Optional: small delay to avoid overwhelming the scheduler\n")
-                f.write("sleep 0.5\n\n")
-            
-            f.write(f"echo \"All jobs submitted for {method} with seeds {seeds[0]}-{seeds[-1]}\"\n")
-        
-        os.chmod(shell_script_path, 0o755)
-        print(f"  Created: {shell_script_path}")
-    
-    print("\n" + "=" * 70)
-    print("SHELL SCRIPT GENERATION COMPLETE!")
-    print(f"Scripts directory: {scripts_dir}")
-    print(f"Logs directory: {logs_dir}")
-    print("\nTo run all methods, execute:")
-    print(f"  bash {master_script_path}")
-    print("\nOr to run a specific method:")
-    print(f"  bash {scripts_dir}/run_hepmass_METHODNAME.sh")
-    print("=" * 70)
-
-
 if __name__ == "__main__":
-    if METHOD == "ALL":
-        generate_shell_scripts()
-    else:
-        # Run specific method
-        try:
-            exper_med = run_method_experiment(METHOD)
-        except KeyboardInterrupt:
-            print(f"\nExperiment for {METHOD} interrupted by user.")
-        except Exception as e:
-            print(f"\nFatal error in {METHOD} experiment: {e}")
-            import traceback
-            traceback.print_exc()
+    try:
+        exper_med = run_method_experiment(METHOD)
+    except KeyboardInterrupt:
+        print(f"\nExperiment for {METHOD} interrupted by user.")
+    except Exception as e:
+        print(f"\nFatal error in {METHOD} experiment: {e}")
+        import traceback
+        traceback.print_exc()
