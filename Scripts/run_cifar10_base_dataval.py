@@ -1,4 +1,4 @@
-# run_adult_dataval.py
+# run_cifar10_dataval.py
 
 from random import seed
 from sklearn.utils import shuffle
@@ -30,19 +30,19 @@ from opendataval.dataval import (
 from opendataval.dataval.lava import SavaEvaluator
 from opendataval.dataval.kairos.bkairos import bKairos
 from opendataval.experiment import ExperimentMediator
-from opendataval.experiment.exper_methods import (
+from opendataval.experiment.exper_methods    import (
     discover_corrupted_sample,
     noisy_detection,
     remove_high_low,
     save_dataval
 )
-from opendataval.model import ClassifierMLP
+from opendataval.model.api import ClassifierSkLearnWrapper
 from opendataval.dataval.knnshap import KNNShapleyLSH
 
 # ============================
 # Argument parsing
 # ============================
-parser = argparse.ArgumentParser(description="Run Adult data valuation experiment")
+parser = argparse.ArgumentParser(description="Run CIFAR-10 data valuation experiment")
 parser.add_argument("--seed", type=int, default=42)
 
 parser.add_argument(
@@ -85,12 +85,6 @@ parser.add_argument(
     type=int,
     default=None,
     help="Number of models (AME, DataBanzhaf, BetaShapley, etc)"
-)
-parser.add_argument(
-    "--num_models_list",
-    type=str,
-    default=None,
-    help="Comma-separated num_models values for DataOob, run together in one job (e.g. 1,2,5)"
 )
 parser.add_argument(
     "--mc_epochs",
@@ -141,6 +135,21 @@ parser.add_argument(
     help="RL batch size for DVRL (default: 32)"
 )
 parser.add_argument(
+    "--dvrl_epochs_list",
+    type=str,
+    default=None,
+    help="Comma-separated rl_epochs values for DVRL, crossed with rl_batch_size "
+         "in one job (e.g. 5000,10000). Overrides the default [1000,2000,3000] sweep."
+)
+parser.add_argument(
+    "--inrun_batch_sizes",
+    type=str,
+    default=None,
+    help="Comma-separated batch sizes for InRunDataShapleyGhost, run together "
+         "in one job (e.g. 1024,4096,10000,20000). Overrides the default "
+         "[32,64,128,256,512] sweep."
+)
+parser.add_argument(
     "--ak_k_neighbors",
     type=int,
     default=None,
@@ -176,36 +185,6 @@ parser.add_argument(
     default=None,
     help="t for AKShapley (default: 2.2280)"
 )
-parser.add_argument(
-    "--mlp_epochs",
-    type=int,
-    default=5,
-    help="Number of epochs for MLP training (default: 5)"
-)
-parser.add_argument(
-    "--mlp_batch_size",
-    type=int,
-    default=32,
-    help="Batch size for MLP training (default: 32)"
-)
-parser.add_argument(
-    "--mlp_lr",
-    type=float,
-    default=0.001,
-    help="Learning rate for MLP training (default: 0.001)"
-)
-parser.add_argument(
-    "--mlp_hidden_dim",
-    type=int,
-    default=32,
-    help="Hidden dimension for MLP (default: 32)"
-)
-parser.add_argument(
-    "--mlp_layers",
-    type=int,
-    default=2,
-    help="Number of hidden layers for MLP (default: 2)"
-)
 args = parser.parse_args()
 
 SEED = args.seed
@@ -216,9 +195,6 @@ NOISE_RATE = args.noise_rate
 K_NEIGHBORS = args.k_neighbors
 SUBSET_SIZE = args.subset_size
 NUM_MODELS = args.num_models
-NUM_MODELS_LIST = (
-    [int(x) for x in args.num_models_list.split(",")] if args.num_models_list else None
-)
 MC_EPOCHS = args.mc_epochs
 LAM_Y = args.lam_y
 LAMBDA_WEIGHT = args.lambda_weight
@@ -227,29 +203,25 @@ BLUR = args.blur
 NUM_SAMPLES = args.num_samples
 RL_EPOCHS = args.rl_epochs
 RL_BATCH_SIZE = args.rl_batch_size
+DVRL_EPOCHS_LIST = (
+    [int(x) for x in args.dvrl_epochs_list.split(",")] if args.dvrl_epochs_list else None
+)
+INRUN_BATCH_SIZES = (
+    [int(x) for x in args.inrun_batch_sizes.split(",")] if args.inrun_batch_sizes else None
+)
 AK_K_NEIGHBORS = args.ak_k_neighbors
 AK_N_HASH_TABLE = args.ak_n_hash_table
 AK_EPS = args.ak_eps
 AK_ALPHA = args.ak_alpha
 AK_DIST_RAND = args.ak_dist_rand
 AK_T = args.ak_t
-MLP_EPOCHS = args.mlp_epochs
-MLP_BATCH_SIZE = args.mlp_batch_size
-MLP_LR = args.mlp_lr
-MLP_HIDDEN_DIM = args.mlp_hidden_dim
-MLP_LAYERS = args.mlp_layers
 
-print("Running Adult experiment with:")
+print("Running CIFAR-10 experiment with:")
 print(f"  - SEED: {SEED}")
 print(f"  - METHOD: {METHOD}")
 print(f"  - JOB_ID: {JOB_ID}")
 print(f"  - NOISE_RATE: {NOISE_RATE}")
 print(f"  - K_NEIGHBORS: {K_NEIGHBORS}")
-print(f"  - MLP_EPOCHS: {MLP_EPOCHS}")
-print(f"  - MLP_BATCH_SIZE: {MLP_BATCH_SIZE}")
-print(f"  - MLP_LR: {MLP_LR}")
-print(f"  - MLP_HIDDEN_DIM: {MLP_HIDDEN_DIM}")
-print(f"  - MLP_LAYERS: {MLP_LAYERS}")
 
 # ============================================================
 # SEEDING (for reproducibility)
@@ -272,56 +244,60 @@ def set_global_seeds(seed=42):
 # ============================================================
 
 def create_experiment_mediator(cache_dir="./data_files/", seed=42):
-    """Create experiment mediator for Adult dataset with MLP model."""
-    
+    """Create experiment mediator for CIFAR-10 with ResNet9 embeddings (128-dim).
+
+    Input: x_train shape (40000, 128) from registered cifar10-embedding-resnet9 dataset
+    """
+
     print("\n" + "="*60)
-    print("CREATING EXPERIMENT MEDIATOR (Adult dataset with MLP)")
+    print("CREATING EXPERIMENT MEDIATOR (ResNet9 128-dim embeddings)")
     print("="*60)
-    
-    # Load the registered Adult dataset
-    print("\nLoading registered dataset 'adult'...")
+        # Load the registered embedding dataset
+    print("\nLoading registered dataset 'cifar10-embedding-resnet9'...")
     # Fixed split seed so train/valid/test indices never change across --seed runs;
     # label noise (below) still varies with SEED.
     SPLIT_SEED = 42
     fetcher = DataFetcher(
-        "adult",
+        "cifar10-embedding-resnet9",
         cache_dir=cache_dir,
         random_state=SPLIT_SEED
     )
 
     print(f"Total samples loaded: {fetcher.num_points}")
 
-    # Split deterministically with fixed seed (30K/5K/13,842)
+    # Split deterministically with fixed seed (40K/10K/10K)
     print("\nSplitting with deterministic counts (seed={})...".format(seed))
-    fetcher.split_dataset_by_count(30000, 5000, 13842)
+    fetcher.split_dataset_by_count(40000, 10000, 10000)
 
     # Add label noise
     print(f"\nAdding {NOISE_RATE*100}% label noise...")
     fetcher = fetcher.noisify(mix_labels, noise_rate=NOISE_RATE, rng=SEED)
 
-    # Prediction model: ClassifierMLP
-    input_dim = fetcher.x_train.shape[1]
+    # Prediction model: ClassifierMLP with auto-detected input dimension
+    input_dim = fetcher.x_train.shape[1]  # Auto-detect from embeddings (128-dim for ResNet9)
     print(f"\nCreating ClassifierMLP with parameters:")
-    print(f"  input_dim: {input_dim} (auto-detected from data)")
-    print(f"  num_classes: 2")
-    print(f"  layers: {MLP_LAYERS}")
-    print(f"  hidden_dim: {MLP_HIDDEN_DIM}")
+    print(f"  input_dim: {input_dim} (auto-detected from embeddings)")
+    print(f"  num_classes: 10")
+    print(f"  layers: 2")
+    print(f"  hidden_dim: 100")
+
+    from opendataval.model import ClassifierMLP
 
     pred_model = ClassifierMLP(
         input_dim=input_dim,
-        num_classes=2,
-        layers=MLP_LAYERS,
-        hidden_dim=MLP_HIDDEN_DIM,
+        num_classes=10,
+        layers=2,
+        hidden_dim=100,
     )
 
-    # Training kwargs
+    # Training kwargs from tuning
     train_kwargs = {
-        "epochs": MLP_EPOCHS,
-        "batch_size": MLP_BATCH_SIZE,
-        "lr": MLP_LR,
+        "epochs": 5,
+        "batch_size": 32,
+        "lr": 0.001,
     }
 
-    print(f"\nTraining kwargs:")
+    print(f"\nTraining kwargs from tuning:")
     print(f"  epochs: {train_kwargs['epochs']}")
     print(f"  batch_size: {train_kwargs['batch_size']}")
     print(f"  lr: {train_kwargs['lr']}")
@@ -356,7 +332,7 @@ def create_experiment_mediator(cache_dir="./data_files/", seed=42):
 
 
 # ============================================================
-# EVALUATOR CREATION
+# EVALUATOR CREATION (for scalability study)
 # ============================================================
 
 def create_method_evaluators(method_name, output_dir=None):
@@ -364,14 +340,11 @@ def create_method_evaluators(method_name, output_dir=None):
     print(f"\nCreating evaluators for method: {method_name}")
     
     if method_name == "DataOob":
-        proportions = [0.1, 0.5, 1.0] if PROPORTION is None else [PROPORTION]
-        if NUM_MODELS_LIST is not None:
-            num_models_values = NUM_MODELS_LIST
-        else:
-            num_models_values = [NUM_MODELS if NUM_MODELS is not None else 0]
+        # Test different bootstrap proportions for scalability study
+        proportions = [0.1,0.5,1.0] if PROPORTION is None else [PROPORTION]
+        num_models = NUM_MODELS if NUM_MODELS is not None else 0
         evaluators = [
-            DataOob(num_models=n, proportion=p, random_state=SEED)
-            for n in num_models_values
+            DataOob(num_models=num_models, proportion=p, random_state=SEED)
             for p in proportions
         ]
 
@@ -402,17 +375,18 @@ def create_method_evaluators(method_name, output_dir=None):
                 num_models=n_models,
                 subset_size=s_size,
                 # +1 so this evaluator's own subsample RNG doesn't reuse the
-                # exact seed passed to noisify()'s rng=SEED (see Hep1K debug:
-                # RandomState(seed).choice(N,K,replace=False) is deterministic,
-                # so matching seeds can silently correlate/collide).
+                # exact seed passed to noisify()'s rng=SEED (see Hep1K/Adult
+                # debug: RandomState(seed).choice(N,K,replace=False) is
+                # deterministic, so matching seeds can silently correlate --
+                # confirmed here since subset_size=8000 == noise_count=8000).
                 random_state=SEED + 1
             )
         ]
 
     elif method_name == "LOO_Random":
         evaluators = [RandomEvaluator(random_state=SEED)]
-        
     elif method_name == "KAIROS":
+        # ONE evaluator - kernels computed once, lambda tuned later
         lambda_weight = LAMBDA_WEIGHT if LAMBDA_WEIGHT is not None else 0.97
         num_samples = NUM_SAMPLES if NUM_SAMPLES is not None else 10000
         evaluators = [
@@ -426,13 +400,14 @@ def create_method_evaluators(method_name, output_dir=None):
                 debug=True
             )
         ]
-        
     elif method_name == "KNNShapley":
+        # Regular KNNShapley (exact neighbors)
         k_value = K_NEIGHBORS if K_NEIGHBORS is not None else 100
         print(f"\nCreating KNNShapley evaluator with k={k_value}")
         evaluators = [KNNShapley(k_neighbors=k_value)]
 
     elif method_name == "AKShapley":
+        # KNNShapley with LSH (Locality Sensitive Hashing - approximate neighbors)
         k_neighbors = AK_K_NEIGHBORS if AK_K_NEIGHBORS is not None else 100
         n_hash_table = AK_N_HASH_TABLE if AK_N_HASH_TABLE is not None else 100
         eps = AK_EPS if AK_EPS is not None else 0.001
@@ -440,28 +415,31 @@ def create_method_evaluators(method_name, output_dir=None):
         dist_rand = AK_DIST_RAND if AK_DIST_RAND is not None else 31.9286
         t = AK_T if AK_T is not None else 2.2280
 
-        evaluators = [
-            KNNShapleyLSH(
-                k_neighbors=k_neighbors,
-                n_hash_table=n_hash_table,
-                eps=eps,
-                dist_rand=dist_rand,
-                t=t,
-                alpha=alpha,
-                random_state=SEED
-            )
-        ]
+        evaluators = []
+        print(f"\nCreating AKShapley (KNNShapleyLSH) with k={k_neighbors}, n_hash_table={n_hash_table}, eps={eps}, alpha={alpha}, dist_rand={dist_rand}, t={t}")
+
+        evaluator = KNNShapleyLSH(
+            k_neighbors=k_neighbors,
+            n_hash_table=n_hash_table,
+            eps=eps,
+            dist_rand=dist_rand,
+            t=t,
+            alpha=alpha,
+            random_state=SEED
+        )
+        evaluators.append(evaluator)
         
     elif method_name == "DVRL":
-        rl_epochs = RL_EPOCHS if RL_EPOCHS is not None else 10000
-        rl_batch_size = RL_BATCH_SIZE if RL_BATCH_SIZE is not None else 32
+        batch_sizes = [RL_BATCH_SIZE] if RL_BATCH_SIZE is not None else [32, 64, 128, 256, 512]
+        epochs_values = DVRL_EPOCHS_LIST if DVRL_EPOCHS_LIST is not None else [1000, 2000, 3000]
         evaluators = [
             DVRL(
-                rl_epochs=rl_epoch,
+                rl_epochs=rl_epochs,
                 rl_batch_size=rl_batch_size,
                 random_state=SEED
             )
-            for rl_epoch in [5000,10000]
+            for rl_batch_size in batch_sizes
+            for rl_epochs in epochs_values
         ]
                     
     elif method_name == "BetaShapley":
@@ -480,7 +458,6 @@ def create_method_evaluators(method_name, output_dir=None):
                 debug=True
             )
         ]
-        
     elif method_name == "SAVA":
         lam_y = LAM_Y if LAM_Y is not None else 5.0
         lam_x = LAM_X if LAM_X is not None else 1.0
@@ -496,36 +473,35 @@ def create_method_evaluators(method_name, output_dir=None):
         ]
 
     elif method_name == "InRunDataShapleyGhost":
-        epochs = 5
-        batch_sizes = [32, 100, 1000, 10000]
-        lr = 0.001
+        EPOCHS = 5
+        BATCH_SIZES = INRUN_BATCH_SIZES if INRUN_BATCH_SIZES is not None else [32, 64, 128, 256, 512]
+        LR = 0.001
         # Debug CSVs are named only by epochs/batch_size/lr (no seed), so they
         # must live under this run's own output_dir to avoid seeds overwriting
         # each other's debug files.
         plot_dir = os.path.join(output_dir, "debugs") if output_dir else "debugs"
         evaluators = [
             InRunDataShapleyGhost(
-                epochs=epochs,
-                batch_size=batch_size,
-                learning_rate=lr,
+                epochs=EPOCHS,
+                batch_size=BATCH_SIZE,
+                learning_rate=LR,
                 random_state=SEED,
                 verbose=True,
-                # OneCycleLR's pct_start = lr_peak_epoch/epochs defaults to
-                # 5/5 = 1.0 here (degenerate: zero-length final phase ->
-                # ZeroDivisionError on the last step). scheduler_type="none"
-                # disables the LR scheduler entirely (fixed learning_rate).
+                # OneCycleLR (the default) divides by zero on a ragged last
+                # batch. scheduler_type="none" disables the LR scheduler
+                # entirely, so the optimizer uses a fixed learning_rate.
                 scheduler_type="none",
                 save_plots=True,
                 plot_dir=plot_dir
             )
-            for batch_size in batch_sizes
+            for BATCH_SIZE in BATCH_SIZES
         ]
 
     elif method_name == "LoGRA":
-        epochs = MLP_EPOCHS
-        batch_size = MLP_BATCH_SIZE
-        lr = MLP_LR
-        lora_configs = [
+        EPOCHS = 5
+        BATCH_SIZE = 32
+        LR = 0.001
+        LORA_CONFIGS = [
             ('none', 'none'),
             ('none', 'raw'),
             ('none', 'kfac'),
@@ -537,15 +513,15 @@ def create_method_evaluators(method_name, output_dir=None):
         ]
         evaluators = [
             LoGRA(
-                epochs=epochs,
-                batch_size=batch_size,
-                learning_rate=lr,
+                epochs=EPOCHS,
+                batch_size=BATCH_SIZE,
+                learning_rate=LR,
                 lora=config[0],
                 hessian=config[1],
                 random_state=SEED,
                 verbose=True
             )
-            for config in lora_configs
+            for config in LORA_CONFIGS
         ]
 
     elif method_name == "ALL":
@@ -639,24 +615,31 @@ def save_time_memory_report(exper_med, output_dir, method_name):
 # ============================================================
 
 def run_method_experiment(method_name):
-    """Run data valuation experiment on Adult dataset with MLP."""
-    
+    """Run data valuation experiment on CIFAR-10 with ResNet9 embeddings (128-dim).
+
+    Data flow:
+    1. Load cifar10-embedding-resnet9 dataset (cached after first run)
+    2. Apply deterministic split: 40K train, 10K valid, 10K test (seed=42)
+    3. Add label noise (20% by default)
+    4. Compute data values using specified method
+    """
     print("=" * 70)
-    print(f"Adult Data Valuation with MLP - {method_name}")
+    print(f"CIFAR-10 Data Valuation - ResNet9 Embeddings (128-dim) - {method_name}")
     print("=" * 70)
 
     # Set reproducibility seeds
     set_global_seeds(SEED)
 
     start_time = time.time()
+  
 
     # Create experiment mediator
-    print("\n1. Creating experiment mediator...")
+    print("\n3. Creating experiment mediator...")
     exper_med = create_experiment_mediator(
         cache_dir="./data_files/", seed=SEED
     )
     
-    # Create output directory
+    # Create output directory (matching DogFish structure)
     base_results_dir = "Results"
     output_dir = os.path.join(base_results_dir, method_name, f'SEED{SEED}_JOB{JOB_ID}')
     os.makedirs(output_dir, exist_ok=True)
@@ -664,11 +647,11 @@ def run_method_experiment(method_name):
     print(f"\nOutput directory: {output_dir}")
 
     # Create method-specific evaluators
-    print(f"\n2. Creating evaluators for {method_name}...")
+    print(f"\n4. Creating evaluators for {method_name}...")
     all_evaluators = create_method_evaluators(method_name, output_dir)
 
     # Compute data values
-    print(f"\n3. Computing data values for {method_name} ({len(all_evaluators)} evaluators)...")
+    print(f"\n5. Computing data values for {method_name} ({len(all_evaluators)} evaluators)...")
     try:
         exper_med = exper_med.compute_data_values(data_evaluators=all_evaluators)
         print(f"✓ {method_name} computation completed successfully")
@@ -684,7 +667,7 @@ def run_method_experiment(method_name):
         base_output_dir = output_dir
         lambda_timing_results = []
 
-        print(f"\n4. Running lambda tuning for KAIROS...")
+        print(f"\n6. Running lambda tuning for KAIROS...")
         for lam in LAMBDA_VALUES:
             # Create lambda-specific output directory
             lambda_dir = os.path.join(base_output_dir, f"LAMBDA_{lam}")
@@ -734,7 +717,7 @@ def run_method_experiment(method_name):
 
     else:
         # Standard evaluation for other methods
-        print(f"\n4. Running evaluations for {method_name}...")
+        print(f"\n6. Running evaluations for {method_name}...")
         evaluation_functions = [
             (noisy_detection, "Noisy detection"),
             (discover_corrupted_sample, "Corrupted sample discovery"),
@@ -749,7 +732,7 @@ def run_method_experiment(method_name):
                 print(f"  ✗ {eval_name} failed: {e}")
 
         # Save data values
-        print(f"\n5. Saving data values for {method_name}...")
+        print(f"\n7. Saving data values for {method_name}...")
         try:
             values = exper_med.evaluate(save_dataval, save_output=True)
             print(f"  ✓ Data values saved")
@@ -757,7 +740,7 @@ def run_method_experiment(method_name):
             print(f"  ✗ Data values save failed: {e}")
     
     # Save time/memory report
-    print(f"\n6. Generating time/memory report...")
+    print(f"\n8. Generating time/memory report...")
     save_time_memory_report(exper_med, output_dir, method_name)
 
     # Calculate total time
@@ -767,8 +750,10 @@ def run_method_experiment(method_name):
 
     # Save final summary
     summary_path = os.path.join(output_dir, f"summary_{method_name}.txt")
+    data_source = "ResNet9 embeddings (generated)"
+    feature_dim = "128-dim"
     with open(summary_path, 'w') as f:
-        f.write(f"Adult Data Valuation with MLP - {method_name}\n")
+        f.write(f"CIFAR-10 Data Valuation - {method_name}\n")
         f.write("=" * 70 + "\n\n")
         f.write("EXPERIMENT CONFIGURATION:\n")
         f.write("-" * 70 + "\n")
@@ -776,19 +761,15 @@ def run_method_experiment(method_name):
         f.write(f"Seed: {SEED}\n")
         f.write(f"Job ID: {JOB_ID}\n")
         f.write(f"Noise Rate: {NOISE_RATE}\n")
-        f.write(f"Data: Train/Valid/Test = 30000/5000/13842\n")
-        f.write(f"Dataset: Adult\n")
-        f.write(f"Features: {exper_med.fetcher.x_train.shape[1]}-dim\n")
+        f.write(f"Data: Train/Valid/Test = 40000/10000/10000\n")
+        f.write(f"Data Source: {data_source}\n")
+        f.write(f"Features: {feature_dim}\n")
         f.write(f"Split Method: deterministic (fixed seed={SEED})\n")
-        f.write(f"Classes: 2\n\n")
+        f.write(f"Classes: 10 (CIFAR-10)\n\n")
         f.write("MODEL CONFIGURATION:\n")
         f.write("-" * 70 + "\n")
-        f.write(f"Model: ClassifierMLP\n")
-        f.write(f"Layers: {MLP_LAYERS}\n")
-        f.write(f"Hidden Dimension: {MLP_HIDDEN_DIM}\n")
-        f.write(f"Epochs: {MLP_EPOCHS}\n")
-        f.write(f"Batch Size: {MLP_BATCH_SIZE}\n")
-        f.write(f"Learning Rate: {MLP_LR}\n")
+        f.write(f"Model: ClassifierMLP (2-layer)\n")
+        f.write(f"Input Dim: 512\n")
         f.write("-" * 70 + "\n")
         f.write(f"Total Evaluators: {len(all_evaluators)}\n")
         f.write(f"Completion Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -822,25 +803,25 @@ def run_all_methods():
     
     # Master script
     master_script = """#!/bin/bash
-# Master script to submit all Adult data valuation jobs with MLP
+# Master script to submit all CIFAR-10 data valuation jobs
 
 METHODS=("DataOob" "AME" "DataBanzhaf" "DataShapley" "InfluenceSubsample" 
          "LOO_Random" "KNNShapley" "DVRL" "BetaShapley" "LAVA")
 
 for method in "${METHODS[@]}"; do
     echo "Submitting job for method: $method"
-    sbatch run_adult_${method}.sh
+    sbatch run_cifar10_${method}.sh
     sleep 2
 done
 
 echo "All jobs submitted!"
 """
     
-    with open("submit_all_adult_methods.sh", "w") as f:
+    with open("submit_all_cifar10_methods.sh", "w") as f:
         f.write(master_script)
     
-    os.chmod("submit_all_adult_methods.sh", 0o755)
-    print("Created master script: submit_all_adult_methods.sh")
+    os.chmod("submit_all_cifar10_methods.sh", 0o755)
+    print("Created master script: submit_all_cifar10_methods.sh")
     
     # Individual job scripts
     for method in methods:
@@ -848,10 +829,10 @@ echo "All jobs submitted!"
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=56
-#SBATCH --output=logs/run_adult_{method}_%j.log
-#SBATCH --error=logs/run_adult_{method}_%j.err
+#SBATCH --output=logs/run_cifar10_{method}_%j.log
+#SBATCH --error=logs/run_cifar10_{method}_%j.err
 #SBATCH --time=36:00:00
-#SBATCH --job-name=adult_{method}
+#SBATCH --job-name=cifar10_{method}
 
 # Environment setup
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
@@ -861,23 +842,23 @@ conda deactivate 2>/dev/null || true
 source ~/ghost_env/.venv/bin/activate
 
 # Move to script directory
-cd /srv/lustre01/project/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/Fine_grained_valuation/Revision/Adult
+cd /srv/lustre01/project/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/Fine_grained_valuation/Revision/CIFAR10
 
 # Create logs directory
 mkdir -p logs
 
 # Run experiment
-echo "Starting Adult experiment with MLP for method: {method}"
+echo "Starting CIFAR-10 experiment for method: {method}"
 echo "Job ID: $SLURM_JOB_ID"
 echo "Start time: $(date)"
 
-python run_adult_dataval.py --seed 42 --method {method} --job_id $SLURM_JOB_ID --noise_rate 0.2 --mlp_epochs 5 --mlp_batch_size 32 --mlp_lr 0.001 --mlp_hidden_dim 100 --mlp_layers 2
+python run_cifar10_dataval.py --seed 42 --method {method} --job_id $SLURM_JOB_ID --noise_rate 0.2
 
 echo "Job completed for method: {method}"
 echo "End time: $(date)"
 """
         
-        script_filename = f"run_adult_{method}.sh"
+        script_filename = f"run_cifar10_{method}.sh"
         with open(script_filename, "w") as f:
             f.write(job_script)
         
@@ -885,7 +866,7 @@ echo "End time: $(date)"
         print(f"Created job script: {script_filename}")
     
     print("\nTo run all methods, execute:")
-    print("  ./submit_all_adult_methods.sh")
+    print("  ./submit_all_cifar10_methods.sh")
 
 
 # ============================================================
@@ -894,22 +875,22 @@ echo "End time: $(date)"
 
 if __name__ == "__main__":
     print("\n" + "="*70)
-    print("ADULT DATA VALUATION WITH MLP")
+    print("CIFAR-10 DATA VALUATION WITH RESNET9 EMBEDDINGS (128-dim)")
     print("="*70)
-    print(f"\n📊 Dataset: Adult")
-    print(f"   - Data: 48,842 samples → Split 30K/5K/13,842 (deterministic, seed=42)")
-    print(f"   - Features: { 'auto-detected' }")
-    print(f"   - Model: MLP with {MLP_LAYERS} layers, {MLP_HIDDEN_DIM} hidden dim")
+    print(f"\n📊 Dataset: cifar10-embedding-resnet9 (registered)")
+    print(f"   - Data: 60K samples → Split 40K/10K/10K (deterministic, seed=42)")
+    print(f"   - Embeddings: 128-dim ResNet9 features")
+    print(f"   - Caching: Automatic (fast on subsequent runs)")
+    print(f"\n⚠ IMPORTANT: Before running methods, ensure hyperparameters are tuned!")
+    print(f"  Run: cd ModelTuning && ./run_tuning.sh")
+    print(f"  This will create: ModelTuning/best_config.json")
     print(f"\nConfiguring experiment with:")
     print(f"  - Seed: {SEED}")
     print(f"  - Method: {METHOD}")
     print(f"  - Noise Rate: {NOISE_RATE}")
     print(f"  - Job ID: {JOB_ID}")
-    print(f"  - MLP Epochs: {MLP_EPOCHS}")
-    print(f"  - MLP Batch Size: {MLP_BATCH_SIZE}")
-    print(f"  - MLP Learning Rate: {MLP_LR}")
     print(f"\nUsage:")
-    print(f"  python run_adult_dataval.py --seed 42 --method KNNShapley")
+    print(f"  python run_cifar10_dataval.py --seed 42 --method KNNShapley")
     print("\n" + "="*70 + "\n")
 
     if METHOD == "ALL":

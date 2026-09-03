@@ -1,4 +1,4 @@
-# run_dogfish_dataval.py
+# run_hepmass_dataval.py
 import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
@@ -45,9 +45,79 @@ try:
 except ImportError:
     print("⚠ LogIX not available (optional for LoGRA)")
 
+# =============================================================================
+# REFERENCE: How to instantiate all available evaluators with their parameters
+# =============================================================================
+#
+# # Combine multiple evaluators (do NOT overwrite the list)
+# evaluators = []
+#
+# # KNNShapley - k-nearest neighbors Shapley value
+# evaluators.append(KNNShapley(k_neighbors=10))
+#
+# # KNNShapleyLSH - LSH variant of KNN Shapley
+# evaluators.append(KNNShapleyLSH(k_neighbors=10, n_hash_table=20, eps=0.01,
+#                                  dist_rand=7.2352, t=2.2510, alpha=0.5,
+#                                  random_state=42))
+#
+# # DataOob - Out-of-bag data valuation
+# evaluators.append(DataOob(num_models=100, proportion=0.8, random_state=42))
+#
+# # DataShapley - Monte Carlo Shapley
+# evaluators.append(DataShapley(mc_epochs=5000, min_cardinality=5,
+#                               cache_name="shapley_cache", random_state=42))
+#
+# # BetaShapley - Beta distribution-based Shapley
+# evaluators.append(BetaShapley(num_models=1000, random_state=42))
+#
+# # DataBanzhaf - Banzhaf value approximation
+# evaluators.append(DataBanzhaf(num_models=1000, random_state=42))
+#
+# # LeaveOneOut - Exact leave-one-out valuation
+# evaluators.append(LeaveOneOut())
+#
+# # RandomEvaluator - Random baseline
+# evaluators.append(RandomEvaluator(random_state=42))
+#
+# # InfluenceSubsample - Influence function with subsampling
+# evaluators.append(InfluenceSubsample(num_models=10000, proportion=0.5,
+#                                      random_state=42))
+#
+# # AME - Advantage Model-based Evaluation
+# evaluators.append(AME(num_models=100000, random_state=42))
+#
+# # DVRL - Data Valuation using Reinforcement Learning
+# evaluators.append(DVRL(rl_epochs=1000, rl_batch_size=32, random_state=42))
+#
+# # LossEvaluator - Simple Loss-Based Data Valuation Baseline
+# # Trains one model to convergence, values each point as negative loss
+# # High-value points = low loss (clean samples)
+# # Low-value points = high loss (noisy/hard samples)
+# evaluators.append(LossEvaluator(epochs=10, batch_size=32, learning_rate=0.01,
+#                                  verbose=True))
+#
+# # LavaEvaluator - Label-aware Shapley with feature importance
+# evaluators.append(LavaEvaluator(blur=0.05, lam_x=1.0, lam_y=1.0,
+#                                 debug=True, random_state=42))
+#
+# # SavaEvaluator - Shapley with Wasserstein distance
+# evaluators.append(SavaEvaluator(batch_size=1024, lam_x=1.0, lam_y=1.0,
+#                                 p=2, blur=0.05, mode="cls", debug=True,
+#                                 random_state=42))
+#
+# # Now compute data values with all evaluators
+# print('Computing data values...')
+# exper_med = exper_med.compute_data_values(data_evaluators=evaluators)
+# print('✓ Computation complete')
+#
+# # Run evaluation on noisy detection
+# results = exper_med.evaluate(noisy_detection, save_output=True)
+# print('\n[Results] Noisy Detection F1-Scores:')
+# print(results)
+# =============================================================================
 
 # Parse command-line arguments
-parser = argparse.ArgumentParser(description='Run DogFish data valuation experiment')
+parser = argparse.ArgumentParser(description='Run HEPMASS data valuation experiment')
 parser.add_argument('--seed', type=int, default=42, help='Random seed for the experiment')
 parser.add_argument('--method', type=str, required=True,
                    choices=['DataOob', 'AME', 'DataBanzhaf', 'DataShapley',
@@ -65,8 +135,8 @@ parser.add_argument(
 parser.add_argument(
     "--subset_size",
     type=int,
-    default=None,  # Use None to indicate "not provided"
-    help="Subset size for InfluenceSubsample. If not set, uses all default values [16, 128, 200, 700]."
+    default=500,
+    help="Subset size for InfluenceSubsample"
 )
 parser.add_argument(
     "--num_models",
@@ -74,12 +144,10 @@ parser.add_argument(
     default=100000,
     help="Number of models for InfluenceSubsample, AME, and other methods"
 )
-parser.add_argument(
-    "--mc_epochs",
-    type=int,
-    default=None,
-    help="MC epochs for DataShapley. If not set, use default [100, 700]."
-)
+parser.add_argument('--dvrl_epochs_list', type=str, default=None,
+                   help='DVRL: comma-separated rl_epochs values (default: 5000)')
+parser.add_argument('--dvrl_batch_size', type=int, default=None,
+                   help='DVRL: rl_batch_size (default: 64)')
 args = parser.parse_args()
 
 # Set seeds
@@ -89,13 +157,14 @@ JOB_ID = args.job_id
 LAM_Y = args.lam_y
 SUBSET_SIZE = args.subset_size
 NUM_MODELS = args.num_models
+DVRL_EPOCHS_LIST = [int(x) for x in args.dvrl_epochs_list.split(",")] if args.dvrl_epochs_list else None
+DVRL_BATCH_SIZE = args.dvrl_batch_size
 
 print(f"Running experiment with:")
 print(f"  - SEED: {SEED}")
 print(f"  - METHOD: {METHOD}")
 print(f"  - JOB_ID: {JOB_ID}")
-print(f"  - NUM_MODELS: {NUM_MODELS}")
-print(f"  - SUBSET_SIZE: {SUBSET_SIZE}")
+
 
 def set_global_seeds(seed):
     """
@@ -114,95 +183,97 @@ def set_global_seeds(seed):
     print(f"[Seeding] ✓ Global seeds configured for reproducibility")
 
 
-def load_and_prepare_dogfish():
-    """Load DogFish embeddings from CSV files."""
-    print("Loading DogFish dataset from CSV files...")
+def load_and_prepare_hepmass():
+    """Load HEPMASS datasets and prepare them for the experiment."""
+    print("Loading HEPMASS datasets...")
 
     # Define data directory with absolute path
-    DATA_DIR = "/srv/lustre01/project/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/Fine_grained_valuation/Revision/DogFish/data"
+    DATA_DIR = "/home/mehdi.touil/lustre/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/Fine_grained_valuation/Revision/Hep1K/Data"
 
     # Load datasets from CSV files
-    train_set = pd.read_csv(os.path.join(DATA_DIR, 'train.csv'))
-    valid_set = pd.read_csv(os.path.join(DATA_DIR, 'valid.csv'))
-    test_set = pd.read_csv(os.path.join(DATA_DIR, 'test.csv'))
-
-    # Extract features and labels (all columns except label, split, sample_id)
-    feature_cols = [col for col in train_set.columns if col.startswith("feat_")]
-
+    train_set = pd.read_csv(os.path.join(DATA_DIR, 'hepmass_train_1000.csv'))
+    valid_set = pd.read_csv(os.path.join(DATA_DIR, 'hepmass_valid_200.csv'))
+    test_set = pd.read_csv(os.path.join(DATA_DIR, 'hepmass_test_500.csv'))
+    
+    # Identify label column (first column based on your code)
+    label_col = train_set.columns[0]
+    print(f"Using label column: '{label_col}'")
+    
+    # Extract features and labels
+    feature_cols = [col for col in train_set.columns if col != label_col]
+    
     X_train = train_set[feature_cols]
-    Y_train = train_set["label"]
-
+    Y_train = train_set[label_col]
+    
     X_valid = valid_set[feature_cols]
-    Y_valid = valid_set["label"]
-
+    Y_valid = valid_set[label_col]
+    
     X_test = test_set[feature_cols]
-    Y_test = test_set["label"]
-
+    Y_test = test_set[label_col]
+    
     print(f"\nData shapes:")
     print(f"X_train: {X_train.shape}")
     print(f"X_valid: {X_valid.shape}")
     print(f"X_test:  {X_test.shape}")
-
+    
     # Scale the features
     print("\nScaling features...")
     scaler = StandardScaler()
-
+    
     # Fit scaler on training data, transform all sets
     X_train_scaled = scaler.fit_transform(X_train)
     X_valid_scaled = scaler.transform(X_valid)
     X_test_scaled = scaler.transform(X_test)
-
+    
     # Convert to numpy arrays with float32 for efficiency
     X_train_np = X_train_scaled.astype(np.float32)
     X_valid_np = X_valid_scaled.astype(np.float32)
     X_test_np = X_test_scaled.astype(np.float32)
-
+    
     # Convert labels to integers
     y_train = Y_train.values.astype(int)
     y_valid = Y_valid.values.astype(int)
     y_test = Y_test.values.astype(int)
-
+    
     print(f"\nOriginal label distributions:")
     print(f"Train - Class 0: {(y_train == 0).sum()}, Class 1: {(y_train == 1).sum()}")
     print(f"Valid - Class 0: {(y_valid == 0).sum()}, Class 1: {(y_valid == 1).sum()}")
     print(f"Test  - Class 0: {(y_test == 0).sum()}, Class 1: {(y_test == 1).sum()}")
-
+    
     # One-hot encoding function
     def to_one_hot_numpy(labels, num_classes=2):
         """Convert 1D label array to one-hot encoded array"""
         return np.eye(num_classes)[labels]
-
+    
     # One-hot encode for OpenDataVal compatibility
     y_train_onehot = to_one_hot_numpy(y_train)
     y_valid_onehot = to_one_hot_numpy(y_valid)
     y_test_onehot = to_one_hot_numpy(y_test)
-
+    
     print(f"\nOne-hot encoded label shapes:")
     print(f"y_train_onehot: {y_train_onehot.shape}")
     print(f"y_valid_onehot: {y_valid_onehot.shape}")
     print(f"y_test_onehot:  {y_test_onehot.shape}")
-
+    
     return X_train_np, y_train_onehot, X_valid_np, y_valid_onehot, X_test_np, y_test_onehot
 
 
 def create_experiment_mediator():
-    """Create and configure the ExperimentMediator for DogFish.
+    """Create and configure the ExperimentMediator for HEPMASS.
 
     CRITICAL: Global seeds are set at the beginning to ensure model
     weight initialization is reproducible.
     """
-    print("Creating DogFish experiment mediator...")
+    print("Creating HEPMASS experiment mediator...")
 
     # ✅ STEP 1: Set global seeds BEFORE loading data or creating any models
     set_global_seeds(SEED)
 
     # ✅ STEP 2: Load and prepare data (uses seeded RNG)
-    X_train, y_train, X_valid, y_valid, X_test, y_test = load_and_prepare_dogfish()
-    # Fixed shuffle seed (42) so train/valid/test split never changes across
-    # --seed runs; only noise injection/model randomness varies with SEED.
+    X_train, y_train, X_valid, y_valid, X_test, y_test = load_and_prepare_hepmass()
     X_train, y_train = shuffle(X_train, y_train, random_state=42)
-    #X_valid, y_valid = shuffle(X_valid, y_valid, random_state=SEED)
-    #X_test, y_test = shuffle(X_test, y_test, random_state=SEED)
+    X_valid, y_valid = shuffle(X_valid, y_valid, random_state=42)
+    X_test, y_test = shuffle(X_test, y_test, random_state=42)
 
     num_classes = y_train.shape[1]
 
@@ -291,18 +362,17 @@ def create_method_evaluators(method_name):
 
     # Your original model sizes
     MODEL_SIZES = [1, 2, 5, 10, 50, 100, 500, 1000, 2000, 3000, 5000]
-
+    
     if method_name == "DataOob":
-        # From Hep1K ACTUAL: [1, 10, 50, 100, 1000] x [1.0, 0.7, 0.5, 0.1]
-        PROPORTIONS = [1.0,0.5, 0.1]
-        MODEL_SIZES = [1, 10, 50, 100]
+        PROPORTIONS = [0.5]
+        MODEL_SIZES = [10]
         evaluators = [
             DataOob(num_models=m, proportion=p, random_state=s)
             for m in MODEL_SIZES
             for p in PROPORTIONS
             for s in [SEED]
             ]
-
+        
     elif method_name == "AME":
         MODEL_SIZES = [100000]
         evaluators = []
@@ -312,108 +382,95 @@ def create_method_evaluators(method_name):
                     continue
                 ame = AME(num_models=m, random_state=s)
                 evaluators.append(ame)
-
+                
     elif method_name == "DataBanzhaf":
-        # From Hep1K: [1000, 10000]
-        MODEL_SIZES = [1000, 10000]
+        MODEL_SIZES = [1000,10000]
 
         evaluators = [
             DataBanzhaf(num_models=m, random_state=s)
             for m in MODEL_SIZES
             for s in [SEED]
         ]
-
+        
     elif method_name == "DataShapley":
-        # From Hep1K ACTUAL: mc_epochs=[100, 700], min_cardinality=5
-        if args.mc_epochs is not None:
-            MC_EPOCHS = [args.mc_epochs]
-        else:
-            MC_EPOCHS = [100, 700]
         evaluators = [
             DataShapley(
-                mc_epochs=mc_epochs,
+                mc_epochs=mc_epochs, 
                 min_cardinality=5,
-                cache_name=f"shapley_mc{mc_epochs}_run{run_idx}_SEED_{SEED}_DOGFISH",
+                cache_name=f"shapley_mc{mc_epochs}_run{run_idx}_SEED_{SEED}_HEPMASS1k",
                 random_state=run_idx
             )
-            for mc_epochs in MC_EPOCHS
-            for run_idx in [SEED]
+            for mc_epochs in [700]
+            for run_idx in [SEED]  # 1..10
         ]
-
+        
     elif method_name == "InfluenceSubsample":
-        # In the argument parser:
 
 
-    # Then in create_method_evaluators:
-        # Check if user provided custom values
-        if args.num_models is not None:
-            num_models_list = [args.num_models]
-        else:
-            num_models_list = [1000, 10000, 100000]
-            
-        if args.subset_size is not None:
-            subset_sizes = [args.subset_size]
-        else:
-            subset_sizes = [16, 128, 200, 700]
-            
+        INFLUENCE_PROPORTIONS = [0.1,0.2,0.5, 0.7]
+        MODEL_SIZES = [1000]
         evaluators = []
-        for num_models in num_models_list:
-            for subset_size in subset_sizes:
-                for s in [SEED]:
-                    evaluators.append(
-                        InfluenceSubsample(
-                            num_models=num_models,
-                            subset_size=subset_size,
-                            # +1 so this evaluator's own subsample RNG doesn't
-                            # reuse the exact seed passed to noisify()'s
-                            # rng=SEED (confirmed leak across Hep1K/Adult/
-                            # CIFAR10/Connect4/DogFish: RandomState(seed)
-                            # .choice(N,K,replace=False) is deterministic).
-                            random_state=s + 1,
-                            verbose=True
-                        )
+
+        for p in [INFLUENCE_PROPORTIONS[3]]:  # Use only the first proportion for testing
+            for s in [SEED]:  # 1..10
+                evaluators.append(
+                    InfluenceSubsample(
+                        num_models=NUM_MODELS,
+                        #proportion=0.7,
+                        subset_size=SUBSET_SIZE,
+                        # random_state offset by +1 so this evaluator's own subsample
+                        # RNG doesn't reuse the exact seed passed to noisify()'s rng=SEED.
+                        # With matching (seed, N, K) both draw identical first samples
+                        # via RandomState(seed).choice(N, K, replace=False) -- see
+                        # mix_labels() in opendataval/dataloader/noisify.py -- which
+                        # silently leaks the noisy-label indices into model 0's subset
+                        # whenever subset_size happens to equal the noise count.
+                        random_state=s + 1,
+                        verbose=True
                     )
 
+                )
+            
     elif method_name == "LOO_Random":
         evaluators = [
             LeaveOneOut(random_state=s) for s in [SEED]
         ] + [
-            RandomEvaluator(random_state=s) for s in [SEED]
+            RandomEvaluator(random_state=s) for s in [SEED]  # 1..10
         ]
 
     elif method_name == "KNNShapley":
         evaluators = []
         for rs in [SEED]:
-            for k in [1, 5, 10, 100, 500, 1000]:
-                evaluators.append(KNNShapley(k_neighbors=k, random_state=rs))
-
+            for k in [10]:
+                evaluators.append(KNNShapley(k_neighbors=k, random_state=rs, debug=True))
+            #evaluators.append(KNNShapley(k_neighbors=10, random_state=rs))
+            #evaluators.append(KNNShapleyLSH(k_neighbors=10, n_hash_table=20, eps=0.01,dist_rand=7.2352 ,t=2.2510,alpha=0.5, random_state=rs))
     elif method_name == "AKShapley":
         evaluators = []
-        for k in [5,10, 100]:
-            for eps in [0.1, 0.01]:
-                for alpha in [0.1, 0.3, 0.5, 0.7, 0.9]:
-                    for n_hash_table in [10, 20, 50]:
+        for k in [10]:
+            for eps in [0.01]:
+                for alpha in [0.1]:
+                    for n_hash_table in [10]:
                         evaluators.append(
                             KNNShapleyLSH(
                                 k_neighbors=k,
                                 n_hash_table=n_hash_table,
                                 eps=eps,
-                                dist_rand=20.0395,
-                                t=2.3290,
+                                dist_rand=7.2352,
+                                t=2.2510,
                                 alpha=alpha,
                                 random_state=SEED,
                             )
                         )
-
+    
     elif method_name == "DVRL":
-        # From Hep1K: epochs=[1000, 2000, 3000] x batch_size=[32, 64, 128, 256, 512]
-        BATCH_SIZES = [32, 64, 128, 256, 512]
-        MODEL_SIZES = [1000, 2000, 3000]
+        BATCH_SIZES = [DVRL_BATCH_SIZE] if DVRL_BATCH_SIZE is not None else [64]
+        MODEL_SIZES = DVRL_EPOCHS_LIST if DVRL_EPOCHS_LIST is not None else [5000]
 
         evaluators = []
         for rl_epochs in MODEL_SIZES:
             for batch_size in BATCH_SIZES:
-                for random_state in [SEED]:
+                for random_state in [SEED]:  # 1 to 10
                     evaluators.append(
                         DVRL(
                             rl_epochs=rl_epochs,
@@ -421,47 +478,45 @@ def create_method_evaluators(method_name):
                             random_state=random_state
                         )
                     )
-
+                    
     elif method_name == "BetaShapley":
-        # From Hep1K: [100, 500, 1000]
         MODEL_SIZES = [100, 500, 1000]
         evaluators = [
             BetaShapley(num_models=m, random_state=s)
             for m in MODEL_SIZES
             for s in [SEED]
         ]
-
+        
     elif method_name == "LAVA":
-        # From Hep1K: lam_y=[1, 5, 10, 50, 100], lam_x=1.0 (fixed), blur=0.05 (fixed)
         LAM_Y = [1, 5, 10, 50, 100]
         evaluators = [
             LavaEvaluator(blur=0.05, debug=True, lam_x=1.0, lam_y=lam_y, random_state=s)
             for lam_y in LAM_Y
             for s in [SEED]
         ]
-
     elif method_name == "SAVA":
         lam_y_values = [1, 5, 10, 50, 100]
+     
 
         evaluators = [
             SavaEvaluator(
-                batch_size=1024,
-                lam_x=1.0,
-                lam_y=lam_y,
-                p=2,
-                blur=0.05,
-                mode="cls",
+                batch_size=1024,           # points per train/val batch
+                lam_x=1.0,                # feature distance weight
+                lam_y=lam_y,               # label distance weight (varied)
+                p=2,                      # p-Wasserstein order
+                blur=0.05,                # GeomLoss entropic scale
+                mode="cls",               # "cls" or "reg"
                 debug=True,
                 random_state=SEED,
                 stratified_batches=True
             )
             for lam_y in lam_y_values
-        ]
-
+        ]    
     elif method_name == "InRunDataShapleyGhost":
-        # From Hep1K: epochs=5, batch_size=[32, 64, 128, 256, 512], lr=0.001
+        # In-Run Shapley with different configurations and random states
         EPOCHS = 5
-        BATCH_SIZES = [32, 64, 128, 256, 512]
+        BATCH_SIZES = [128]
+
         LR = 0.001
         evaluators = [
             InRunDataShapleyGhost(
@@ -469,44 +524,49 @@ def create_method_evaluators(method_name):
                 batch_size=BATCH_SIZE,
                 learning_rate=LR,
                 random_state=s,
-                verbose=True
+                verbose=True,
+                # pct_start = lr_peak_epoch / epochs; default lr_peak_epoch=5 with
+                # EPOCHS=5 gives pct_start=1.0, a zero-length OneCycleLR anneal
+                # phase that ZeroDivisionErrors on the last step when total steps
+                # is small (n_train=1000, batch_size=128 -> only 7 batches/epoch
+                # x 5 = 35 steps). lr_peak_epoch=1 keeps pct_start=0.2, normal.
+                lr_peak_epoch=1,
             )
             for s in [SEED]
             for BATCH_SIZE in BATCH_SIZES
         ]
 
     elif method_name == "LoGRA":
-        # From Hep1K: 6 LoRA/Hessian combinations: epochs=5, batch=32, lr=0.001
         EPOCHS = 5
         BATCH_SIZE = 32
         LR = 0.001
+        # LoGRA with different Hessian and LoRA approximation combinations + SEEDS
         LORA_CONFIGS = [
             ('none', 'none'),
             ('none', 'raw'),
             ('none', 'kfac'),
-            ('none', 'ekfac'),
             ('pca', 'kfac'),
             ('pca', 'ekfac'),
-            ('pca', 'none'),
-            ('pca', 'raw')
+            ('random', 'kfac'),
         ]
         evaluators = [
             LoGRA(
                 epochs=EPOCHS,
                 batch_size=BATCH_SIZE,
                 learning_rate=LR,
-                lora='none',
-                hessian='raw',
+                lora=config[0],
+                hessian=config[1],
                 random_state=s,
                 verbose=True
             )
-            for s in [SEED]
-            #for config in LORA_CONFIGS
+            #for lora, hess in LORA_CONFIGS
+            for s in [SEED]  # Use first 3 SEEDS
+            for config in LORA_CONFIGS
         ]
 
     elif method_name == "Kairos":
-        # From Hep1K: lambda_weight=[0, 0.5, 0.8, 0.9, 0.97, 0.98, 0.99, 1.0]
-        LAMDA = [0, 0.5, 0.8, 0.9, 0.97, 0.98, 0.99, 1.0]
+        # Kairos with different configurations and random states
+        LAMDA = [0,0.5,0.8,0.9,0.97,0.98,0.99,1.0]
 
         evaluators = [
             Kairos(
@@ -517,10 +577,26 @@ def create_method_evaluators(method_name):
                 debug=True
             )
             for lambda_weight in LAMDA
-            for s in [SEED]
+            for s in [SEED]  # Use first 3 SEEDS
         ]
+        # evaluators = [
+        #     bKairos(
+        #         lambda_weight=lambda_weight,
+        #         sigma_feature=3.0,
+        #         batch_size=1024,           # points per train/val batch
+        #         random_state=s,
+        #         debug=True
+        #     )
+        #     for lambda_weight in [0.97]
+        #     for s in [SEED]  # Use first 3 SEEDS
+        # ]
+
 
     elif method_name == "LossEvaluator":
+        # Simple Loss-Based Data Valuation Baseline
+        # Trains one model to convergence, values each point as -loss at optimal params
+        # Low-value points (high loss) = noisy/hard samples
+        # High-value points (low loss) = clean/valuable samples
         EPOCH = 5
         BATCH_SIZE = 32
         evaluators = [
@@ -534,8 +610,9 @@ def create_method_evaluators(method_name):
         ]
 
     elif method_name == "ALL":
+        # Combine all methods (for testing)
         evaluators = []
-        for m in ["LOO_Random"]:
+        for m in ["LOO_Random"]:  # Start with LOO_Random for testing
             evaluators.extend(create_method_evaluators(m))
 
     else:
@@ -626,18 +703,19 @@ def save_time_memory_report(exper_med, output_dir, method_name):
 def run_method_experiment(method_name):
     """Run experiment for a specific method."""
     print("=" * 70)
-    print(f"DogFish Data Valuation Experiment - {method_name}")
+    print(f"HEPMASS Data Valuation Experiment - {method_name}")
     print("=" * 70)
     
     start_time = time.time()
     
     # Create experiment mediator
     exper_med = create_experiment_mediator()
-    
+
     # Create output directory with method name
     base_remote_dir = (
-        f"/srv/lustre01/project/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/Fine_grained_valuation/Revision/DogFish/results"
+        f"/home/mehdi.touil/lustre/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/Fine_grained_valuation/Revision/Hep1K/results"
     )
+    #output_dir = os.path.join(base_remote_dir, f'{method_name}_SEED{SEED}_JOB{JOB_ID}')
     output_dir = os.path.join(base_remote_dir, method_name, f'SEED{SEED}_JOB{JOB_ID}')
 
     os.makedirs(output_dir, exist_ok=True)
@@ -651,7 +729,14 @@ def run_method_experiment(method_name):
     print(f"\nComputing data values for {method_name} ({len(all_evaluators)} evaluators)...")
     
     try:
+        import resource as _resource
+        _ru_before = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
+        _t_before = time.perf_counter()
         exper_med = exper_med.compute_data_values(data_evaluators=all_evaluators)
+        _t_after = time.perf_counter()
+        _ru_after = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
+        print(f"[OUTER-INSTRUMENT] compute_data_values() wall time: {_t_after - _t_before:.3f}s")
+        print(f"[OUTER-INSTRUMENT] ru_maxrss before: {_ru_before} KB, after: {_ru_after} KB, delta: {_ru_after - _ru_before} KB")
         print(f"✓ {method_name} computation completed successfully")
     except Exception as e:
         print(f"✗ {method_name} computation failed: {e}")
@@ -691,7 +776,7 @@ def run_method_experiment(method_name):
     # Save final summary
     summary_path = os.path.join(output_dir, f"summary_{method_name}.txt")
     with open(summary_path, 'w') as f:
-        f.write(f"DogFish Data Valuation - {method_name}\n")
+        f.write(f"HEPMASS Data Valuation - {method_name}\n")
         f.write("=" * 50 + "\n")
         f.write(f"Method: {method_name}\n")
         f.write(f"Seed: {SEED}\n")
@@ -720,8 +805,8 @@ def run_all_methods():
                'LoGRA', 'Kairos']
 
     # Create scripts directory
-    scripts_dir = "/srv/lustre01/project/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/Fine_grained_valuation/Revision/DogFish/scripts"
-    logs_dir = "/srv/lustre01/project/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/Fine_grained_valuation/Revision/DogFish/logs"
+    scripts_dir = "/home/mehdi.touil/lustre/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/Fine_grained_valuation/Revision/Hep1K/scripts"
+    logs_dir = "/home/mehdi.touil/lustre/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/Fine_grained_valuation/Revision/Hep1K/logs"
     os.makedirs(scripts_dir, exist_ok=True)
     os.makedirs(logs_dir, exist_ok=True)
     print(f"Scripts directory: {scripts_dir}")
@@ -729,16 +814,16 @@ def run_all_methods():
 
     # Create a master script to submit all jobs
     master_script = """#!/bin/bash
-# Master script to submit all DogFish data valuation jobs
+# Master script to submit all HEPMASS data valuation jobs
 
-SCRIPTS_DIR="/srv/lustre01/project/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/Fine_grained_valuation/Revision/DogFish/scripts"
+SCRIPTS_DIR="/home/mehdi.touil/lustre/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/Fine_grained_valuation/Revision/Hep1K/scripts"
 METHODS=("DataOob" "AME" "DataBanzhaf" "DataShapley" "InfluenceSubsample"
          "LOO_Random" "KNNShapley" "DVRL" "BetaShapley" "LAVA" "InRunDataShapleyGhost"
          "LoGRA" "Kairos")
 
 for method in "${METHODS[@]}"; do
     echo "Submitting job for method: $method"
-    sbatch "$SCRIPTS_DIR/run_dogfish_${method}.sh"
+    sbatch "$SCRIPTS_DIR/run_hepmass_${method}.sh"
     sleep 2
 done
 
@@ -751,17 +836,17 @@ echo "All jobs submitted!"
 
     os.chmod(master_script_path, 0o755)
     print(f"Created master script: {master_script_path}")
-
+    
     # Create individual job scripts for each method
     for method in methods:
         job_script = f"""#!/bin/bash
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=56
-#SBATCH --output=/srv/lustre01/project/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/Fine_grained_valuation/Revision/DogFish/logs/run_dogfish_{method}_%j.log
-#SBATCH --error=/srv/lustre01/project/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/Fine_grained_valuation/Revision/DogFish/logs/run_dogfish_{method}_%j.err
+#SBATCH --output=/home/mehdi.touil/lustre/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/Fine_grained_valuation/Revision/Hep1K/logs/run_hepmass_{method}_%j.log
+#SBATCH --error=/home/mehdi.touil/lustre/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/Fine_grained_valuation/Revision/Hep1K/logs/run_hepmass_{method}_%j.err
 #SBATCH --time=36:00:00
-#SBATCH --job-name=dogfish_{method}
+#SBATCH --job-name=hepmass_{method}
 
 # ---------------------------------
 # Environment setup
@@ -782,16 +867,16 @@ python --version
 # ---------------------------------
 # Move to CSV data directory
 # ---------------------------------
-cd "/srv/lustre01/project/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/Fine_grained_valuation/Revision/DogFish"
+cd "/home/mehdi.touil/ondemand/Experimental evaluation/Hepmass/HepMASS1K"
 
 # ---------------------------------
 # Run Python script for specific method
 # ---------------------------------
-echo "Starting DogFish experiment for method: {method}"
+echo "Starting HEPMASS experiment for method: {method}"
 echo "Job ID: $SLURM_JOB_ID"
 echo "Start time: $(date)"
 
-python /srv/lustre01/project/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/Fine_grained_valuation/Revision/DogFish/run_dogfish_dataval.py --seed 42 --method {method} --job_id $SLURM_JOB_ID
+python /home/mehdi.touil/lustre/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/Fine_grained_valuation/Revision/Hep1K/run_hepmass_dataval.py --seed 42 --method {method} --job_id $SLURM_JOB_ID
 
 # ---------------------------------
 # Completion message
@@ -804,7 +889,7 @@ echo "Job ID: $SLURM_JOB_ID completed successfully"
 conda deactivate 2>/dev/null || true
 """
 
-        script_filename = os.path.join(scripts_dir, f"run_dogfish_{method}.sh")
+        script_filename = os.path.join(scripts_dir, f"run_hepmass_{method}.sh")
         with open(script_filename, "w") as f:
             f.write(job_script)
 
@@ -814,9 +899,9 @@ conda deactivate 2>/dev/null || true
     print("\nTo run all methods, execute:")
     print(f"  {scripts_dir}/submit_all_methods.sh")
     print("\nOr to run a specific method:")
-    print(f"  sbatch {scripts_dir}/run_dogfish_METHODNAME.sh")
+    print(f"  sbatch {scripts_dir}/run_hepmass_METHODNAME.sh")
     print(f"\nLogs will be saved to: {logs_dir}")
-    print(f"Results will be saved to: /srv/lustre01/project/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/Fine_grained_valuation/Revision/DogFish/results/SEED{SEED}")
+    print(f"Results will be saved to: /home/mehdi.touil/lustre/scalableml-um6p-st-sccs-10v5rwpbsmu/touil-lustre/Fine_grained_valuation/Revision/Hep1K/results/SEED{SEED}")
 
 
 if __name__ == "__main__":
