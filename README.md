@@ -17,10 +17,10 @@ Experimental benchmark for data valuation methods in machine learning, covering 
 ```
 data-valuation/
 ├── src/
-│   ├── fine_grained/          # Fine-grained valuation
+│   ├── fine_grained/          # Extended OpenDataVal: Fine-grained valuation
 │   │   ├── __main__.py        # CLI entry point (Typer)
 │   │   ├── dataloader/        # Dataset fetching, noise injection, registration
-│   │   ├── dataval/           # Extended OpenDataVal: valuation methods (AME, DVRL, LAVA, ...)
+│   │   ├── dataval/           # Valuation methods (AME, DVRL, LAVA, ...)
 │   │   ├── experiment/        # ExperimentMediator orchestration harness
 │   │   └── model/             # Models
 │   └── coarse_grained/        # Coarse-grained valuation
