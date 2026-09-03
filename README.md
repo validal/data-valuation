@@ -20,7 +20,7 @@ data-valuation/
 │   ├── fine_grained/          # Extended OpenDataVal: Fine-grained valuation
 │   │   ├── __main__.py        # CLI entry point (Typer)
 │   │   ├── dataloader/        # Dataset fetching, noise injection, registration
-│   │   ├── dataval/           # Valuation methods (AME, DVRL, LAVA, ...)
+│   │   ├── dataval/           # Valuation methods (KAIROS, DOOB, LoGRA, IR-DShapley, ...)
 │   │   ├── experiment/        # ExperimentMediator orchestration harness
 │   │   └── model/             # Models
 │   └── coarse_grained/        # Coarse-grained valuation
