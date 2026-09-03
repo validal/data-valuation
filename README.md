@@ -40,10 +40,73 @@ data-valuation/
 
 ## Setup
 
+### Quick Install (Automated)
 ```bash
-python -m venv .venv && .\.venv\Scripts\activate
+bash src/fine_grained/setup.sh
+```
+
+### Manual Install
+```bash
+# Clone repository
+git clone https://github.com/validal/data-valuation.git
+cd data-valuation
+
+# Create Python 3.12 virtual environment
+python3.12 -m venv finegrained_valuation
+source finegrained_valuation/bin/activate  # Linux/Mac
+# Or: finegrained_valuation\Scripts\activate  # Windows
+
+# Install PyPI requirements
 pip install -r requirements.txt
-pip install -e .
+
+# Clone and install GhostSuite
+git clone https://github.com/Jiachen-T-Wang/GhostSuite.git
+pip install -e GhostSuite --no-deps
+
+# Install modified opendataval
+pip install -e src/fine_grained/opendataval
+```
+
+---
+
+## Running Experiments
+
+### Fine-grained Data Valuation
+
+**HEPMass Variants (1K to 7M samples):**
+```bash
+python Scripts/run_hep1k_dataval.py
+python Scripts/run_hep10k_dataval.py
+python Scripts/run_hep100k_dataval.py
+python Scripts/run_hep1m_dataval.py
+python Scripts/run_hep7m_dataval.py
+```
+
+**CIFAR-10 with Different ResNets:**
+```bash
+python Scripts/run_cifar10_resnet9_dataval.py --method DOOB
+python Scripts/run_cifar10_resnet18_dataval.py --method LoGRA
+python Scripts/run_cifar10_resnet50_dataval.py --method InRunDataShapleyGhost
+python Scripts/run_cifar10_resnet152_dataval.py --method KairosGPU
+```
+
+**Other Datasets:**
+```bash
+python Scripts/run_adult_dataval.py --method DataOob
+python Scripts/run_connect4_dataval.py --method KNNShapley
+python Scripts/run_dogfish_dataval.py --method LAVA
+python Scripts/run_cifar10_base_dataval.py --method Random
+```
+
+### Fine-grained CLI
+```bash
+python -m src.fine_grained --help
+```
+
+### Coarse-grained Experiments
+```bash
+python src/coarse_grained/scripts/boostrap.py
+python src/coarse_grained/scripts/robustness.py
 ```
 
 ---

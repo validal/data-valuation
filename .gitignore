@@ -140,4 +140,6 @@ experiments/*/results/
 *.swp
 *.swo
 *~
-.DS_Store
+.DS_Storedata/
+GhostSuite/
+data/
