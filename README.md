@@ -87,7 +87,7 @@ python Scripts/run_hep7m_dataval.py
 python Scripts/run_cifar10_resnet9_dataval.py --method DOOB
 python Scripts/run_cifar10_resnet18_dataval.py --method LoGRA
 python Scripts/run_cifar10_resnet50_dataval.py --method InRunDataShapleyGhost
-python Scripts/run_cifar10_resnet152_dataval.py --method KairosGPU
+python Scripts/run_cifar10_resnet152_dataval.py --method Kairos
 ```
 
 **Other Datasets:**
