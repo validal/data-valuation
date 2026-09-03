@@ -139,7 +139,17 @@ All plots and figures are stored in `Plots/`, organized by granularity and exper
 
 ## Acknowledgements
 
-This project builds upon several open-source works. We thank the authors of [OpenDataVal](https://github.com/opendatval/opendatval), [LAVA](https://github.com/reds-lab/LAVA/), [SAVA](https://github.com/skezle/sava), [DAVINZ](https://github.com/ZhaoxuanWu/DAVINZ-DataValuation), and [KNN-PVLDB](https://github.com/AI-secure/KNN-PVLDB) for making their implementations publicly available.
+This project builds upon several open-source works. We thank the authors of:
+- [OpenDataVal](https://github.com/opendatval/opendatval)
+- [LAVA](https://github.com/reds-lab/LAVA/)
+- [SAVA](https://github.com/skezle/sava)
+- [DAVINZ](https://github.com/ZhaoxuanWu/DAVINZ-DataValuation)
+- [KNN-PVLDB](https://github.com/AI-secure/KNN-PVLDB)
+- [KAIROS](https://github.com/lodino/kairos)
+- [GhostSuite](https://github.com/Jiachen-T-Wang/GhostSuite) — Data Shapley in One Training Run
+- [LogIX](https://github.com/logix-project/logix) — LoGRA method
+
+for making their implementations publicly available.
 
 ---
 
