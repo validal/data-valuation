@@ -1,3 +1,2 @@
-from opendataval.dataval.lava.lava import LavaEvaluator, LavaOOBEvaluator,ParallelLavaOOBEvaluator
-from opendataval.dataval.lava.batchlava import BatchwiseLavaEvaluator,HierarchicalLavaEvaluator
-from opendataval.dataval.lava.sava import BatchwiseLavaEvaluator, SavaEvaluator
+from opendataval.dataval.lava.lava import LavaEvaluator
+from opendataval.dataval.lava.sava import SavaEvaluator

@@ -1,7 +1,7 @@
 """GPU-resident KNN-Shapley with LSH acceleration (AKShapley).
 
 ``AKShapleyGPU`` computes the same quantity as
-:class:`~opendataval.dataval.knnshap.scknnshap.KNNShapleyLSH` but moves all
+:class:`~opendataval.dataval.knnshap.knnshaplsh.KNNShapleyLSH` but moves all
 three of the reference implementation's Python loops onto the accelerator.
 The LSH *approximation itself is preserved exactly* -- this is a faster
 evaluation of the same algorithm, not a different (or exact-KNN) one.
@@ -64,7 +64,7 @@ from typing import Optional
 import numpy as np
 import torch
 
-from opendataval.dataval.knnshap.scknnshap import KNNShapleyLSH, f_h
+from opendataval.dataval.knnshap.knnshaplsh import KNNShapleyLSH, f_h
 from opendataval.dataval.progress import progress_range
 from opendataval.model.api import Model
 
@@ -476,7 +476,7 @@ class AKShapleyGPU(KNNShapleyLSH):
             t = self._t_fixed
             print(f"[AKShapleyGPU] Using provided t={t:.4f}")
         elif contrast is not None:
-            from opendataval.dataval.knnshap.scknnshap import find_best_r_normalize
+            from opendataval.dataval.knnshap.knnshaplsh import find_best_r_normalize
 
             t = find_best_r_normalize(np.arange(1e-3, 10, 1e-3), contrast)
             print(f"[AKShapleyGPU] Selected t={t:.4f} via contrast minimization")

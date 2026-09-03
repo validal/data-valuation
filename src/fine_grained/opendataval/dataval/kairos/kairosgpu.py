@@ -56,7 +56,6 @@ class KairosGPU(Kairos):
         num_samples=10000,
         random_state: Optional[RandomState] = None,
         embedding_model: Optional[Model] = None,
-        debug: bool = False,
         device: Optional[torch.device] = None,
         row_chunk: int = 8192,
     ):
@@ -69,7 +68,6 @@ class KairosGPU(Kairos):
             num_samples=num_samples,
             random_state=random_state,
             embedding_model=embedding_model,
-            debug=debug,
         )
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -84,15 +82,14 @@ class KairosGPU(Kairos):
             f"KairosGPU(lambda_weight={self.lambda_weight}, unbiased={self.unbiased}, "
             f"use_median_heuristic={self.use_median_heuristic}, "
             f"num_samples={self.num_samples}, device={self.device.type}, "
-            f"row_chunk={self.row_chunk}, embedding_model={embedding_str}, "
-            f"debug={self.debug})"
+            f"row_chunk={self.row_chunk}, embedding_model={embedding_str})"
         )
 
     __str__ = __repr__
 
-    def input_data(self, x_train, y_train, x_valid, y_valid, debug=True):
+    def input_data(self, x_train, y_train, x_valid, y_valid):
         """Delegate to Kairos, then move the tensors onto the device."""
-        super().input_data(x_train, y_train, x_valid, y_valid, debug=debug)
+        super().input_data(x_train, y_train, x_valid, y_valid)
         for name in ("X_train", "X_valid", "y_train", "y_valid", "r_train"):
             t = getattr(self, name, None)
             if isinstance(t, torch.Tensor):
@@ -124,33 +121,19 @@ class KairosGPU(Kairos):
         dists = torch.linalg.vector_norm(X[idx_i] - X[idx_j], dim=1)
         return float(np.median(dists.detach().cpu().numpy()))
 
-    def train_data_values(self, *args, debug=None, **kwargs):
+    def train_data_values(self, *args, **kwargs):
         """Chunked, GPU-resident version of the Kairos kernel pass."""
-        if debug is None:
-            debug = self.debug
-
         X = self.X_train                     # (n_train, d)
         V = self.X_valid                     # (n_valid, d)
         n_train = X.shape[0]
         n_valid = V.shape[0]
 
-        if debug:
-            print("\n" + "=" * 70)
-            print("[KairosGPU] TRAINING PHASE")
-            print("=" * 70)
-            print(f"  X_train shape: {tuple(X.shape)}  device={X.device}")
-            print(f"  X_valid shape: {tuple(V.shape)}  row_chunk={self.row_chunk}")
-
         # Bandwidth - identical logic to Kairos
         if self.sigma_feature is None and self.use_median_heuristic:
             sigma = self._compute_median_heuristic()
             self.sigma_feature = sigma
-            if debug:
-                print(f"  ✓ Computed sigma_feature = {sigma:.6f}")
         else:
             sigma = self.sigma_feature if self.sigma_feature is not None else 3.0
-            if debug:
-                print(f"  Using provided sigma_feature = {sigma:.6f}")
 
         inv_two_sigma2 = 1.0 / (2.0 * sigma ** 2)
 
@@ -189,24 +172,16 @@ class KairosGPU(Kairos):
         self.avg_K_train = avg_K_train
         self.avg_K_valid = avg_K_valid
 
-        # feature discrepancy - identical to Kairos
+        # feature discrepancy: train - valid, identical to Kairos
         if self.unbiased:
             avg_K_train_unbiased = (self.avg_K_train * n_train - 1) / (n_train - 1)
-            feature_metric = self.avg_K_valid - avg_K_train_unbiased
+            feature_metric = avg_K_train_unbiased - self.avg_K_valid
         else:
-            feature_metric = self.avg_K_valid - self.avg_K_train
+            feature_metric = self.avg_K_train - self.avg_K_valid
 
         squared_residual = torch.sqrt((self.r_train ** 2).sum(dim=1))
 
         self.squared_residual = squared_residual
         self.feature_metric = feature_metric
-
-        if debug:
-            print(f"\n  [Feature Metric] mean={feature_metric.mean():.6f} "
-                  f"std={feature_metric.std():.6f} "
-                  f"min={feature_metric.min():.6f} max={feature_metric.max():.6f}")
-            print(f"  [Squared Residual] mean={squared_residual.mean():.6f} "
-                  f"std={squared_residual.std():.6f}")
-            print("=" * 70)
 
         return self

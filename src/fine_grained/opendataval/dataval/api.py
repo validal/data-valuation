@@ -308,7 +308,7 @@ class DataEvaluator(ABC, ReprMixin):
         x_train, y_train, x_valid, y_valid, *_ = fetcher.datapoints
 
         # Fix label shape: convert [N, 1] to [N] for gradient-based evaluators
-        # (InfluenceFunction, TRACIN, TRAK need 1D labels for cross_entropy)
+        # (InfluenceFunction needs 1D labels for cross_entropy)
         if self._should_squeeze_labels():
             if isinstance(y_train, torch.Tensor) and y_train.dim() > 1 and y_train.shape[1] == 1:
                 y_train = y_train.squeeze(-1)
@@ -319,8 +319,8 @@ class DataEvaluator(ABC, ReprMixin):
 
     def _should_squeeze_labels(self):
         """Check if this evaluator needs squeezed labels."""
-        from opendataval.dataval.influence import InfluenceFunction, TracIn, TRAK
-        return isinstance(self, (InfluenceFunction, TracIn, TRAK))
+        from opendataval.dataval.influence import InfluenceFunction
+        return isinstance(self, InfluenceFunction)
 
     # ------------------------------
     # Memory tracking helpers

@@ -150,7 +150,6 @@ def noisy_detection(
     size_high, mean_high = cluster_stats(valuable, data_values)
     print(f"  Low cluster: size={size_low}, mean={mean_low:.6f}")
     print(f"  High cluster: size={size_high}, mean={mean_high:.6f}")
-
     result = {
         "method": evaluator.__class__.__name__,
         "kmeans_f1": f1_kmeans_label,
@@ -158,7 +157,7 @@ def noisy_detection(
         "mean_low": mean_low,
         "size_high": size_high,
         "mean_high": mean_high,
-        "Exact_recall": recall_exact_label_value,
+        "recall@k": recall_exact_label_value,
     }
 
     print("\n" + "="*80)
@@ -783,7 +782,7 @@ def save_datavalv2(
     )
     data_values = evaluator.evaluate_data_values()
 
-    # Case for LOORemovalRanker with subset ranking
+    # Case for evaluators with subset ranking
     if hasattr(evaluator, "removal_ranking"):
         removal_ranking = evaluator.removal_ranking
         filtered_indices = np.array(train_indices)[removal_ranking]

@@ -5,7 +5,6 @@ Implements the algorithm from:
   "Efficient Task-Specific Data Valuation for Nearest Neighbor Algorithms"
   (Ruoxi Jia et al., VLDB 2019)
 
-The original paper code is preserved as closely as possible.
 """
 import time
 from math import ceil

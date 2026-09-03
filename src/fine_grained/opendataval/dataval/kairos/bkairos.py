@@ -16,7 +16,7 @@ from typing import Optional
 class bKairos(DataEvaluator, ModelLessMixin):
     def __init__(self, lambda_weight=0.97, sigma_feature=None, kernel_type='sigma', unbiased=False,
                  use_median_heuristic=True, num_samples=10000, batch_size=1024,
-                 random_state: Optional = None, embedding_model: Optional[Model] = None, debug: bool = False):
+                 random_state: Optional = None, embedding_model: Optional[Model] = None):
         """
         Batched/scalable version of Kairos for memory-efficient processing.
 
@@ -31,7 +31,6 @@ class bKairos(DataEvaluator, ModelLessMixin):
             batch_size (int): Batch size for kernel computation to reduce memory usage, by default 1024.
             random_state (Optional): Random state for reproducibility, by default None.
             embedding_model (Model, optional): Pre-trained embedding model for computing embeddings, by default None.
-            debug (bool): Print detailed debug information, by default False.
 
         Note:
             No training (optimization) is performed in this class.
@@ -53,7 +52,6 @@ class bKairos(DataEvaluator, ModelLessMixin):
         self.num_samples = num_samples
         self.batch_size = batch_size
         self.embedding_model = embedding_model
-        self.debug = debug
 
         # Data placeholders; these are set by input_data.
         self.X_train = None  # numpy array for efficient kernel computation
@@ -76,7 +74,7 @@ class bKairos(DataEvaluator, ModelLessMixin):
             f"bKairos(lambda_weight={self.lambda_weight}, unbiased={self.unbiased}, "
             f"use_median_heuristic={self.use_median_heuristic}, num_samples={self.num_samples}, "
             f"batch_size={self.batch_size}, embedding_model={embedding_str}, "
-            f"random_state={self.random_state}, debug={self.debug})"
+            f"random_state={self.random_state})"
         )
 
     __str__ = __repr__
@@ -108,7 +106,7 @@ class bKairos(DataEvaluator, ModelLessMixin):
         median_dist = np.median(sampled_dists)
         return median_dist
 
-    def input_data(self, x_train, y_train, x_valid, y_valid, debug=None) -> "bKairos":
+    def input_data(self, x_train, y_train, x_valid, y_valid) -> "bKairos":
         """
         Prepares the training and validation data and computes residuals on the training set.
         The classifier (SKLR) is trained on the validation data and then used to predict
@@ -124,33 +122,17 @@ class bKairos(DataEvaluator, ModelLessMixin):
             Validation features
         y_valid : array-like or torch.Tensor
             Validation labels
-        debug : bool, optional
-            Override instance debug flag, by default None
 
         Returns
         -------
         bKairos
             Self for method chaining
         """
-        if debug is None:
-            debug = self.debug
-
         # Call parent to set self.x_train, self.x_valid for embeddings
         super().input_data(x_train, y_train, x_valid, y_valid)
 
         # Apply embeddings FIRST to original data
         x_train, x_valid = self.embeddings(self.x_train, self.x_valid)
-
-        if debug:
-            print("\n[DEBUG bKairos.input_data] Input shapes:")
-            if isinstance(x_train, torch.Tensor):
-                print(f"  x_train (torch): {x_train.shape}")
-            else:
-                print(f"  x_train (numpy): {np.array(x_train).shape}")
-            if isinstance(y_train, torch.Tensor):
-                print(f"  y_train (torch): {y_train.shape}")
-            else:
-                print(f"  y_train (numpy): {np.array(y_train).shape}")
 
         # Convert inputs to numpy arrays if needed
         if isinstance(x_train, torch.Tensor):
@@ -170,23 +152,13 @@ class bKairos(DataEvaluator, ModelLessMixin):
         y_train = np.array(y_train, dtype=np.float32)
         y_valid = np.array(y_valid, dtype=np.float32)
 
-        if debug:
-            print(f"  After numpy conversion: x_train {x_train.shape}, y_train {y_train.shape}")
-
         # Flatten if image data (4D or higher)
         if x_train.ndim > 2:
-            if debug:
-                print(f"  ⚠️  x_train is {x_train.ndim}D, flattening to 2D...")
             x_train = x_train.reshape(x_train.shape[0], -1)
             x_valid = x_valid.reshape(x_valid.shape[0], -1)
-            if debug:
-                print(f"  ✓ After flattening: x_train {x_train.shape}, x_valid {x_valid.shape}")
 
         self.input_dim = x_train.shape[1]
         self.num_classes = y_train.shape[1] if y_train.ndim > 1 else 1
-
-        if debug:
-            print(f"  input_dim={self.input_dim}, num_classes={self.num_classes}\n")
 
         # Store features as numpy arrays for efficient BLAS-backed kernel computation.
         self.X_train = x_train  # numpy array (n_train, d)
@@ -196,24 +168,12 @@ class bKairos(DataEvaluator, ModelLessMixin):
         self.y_valid = torch.tensor(y_valid, dtype=torch.float32)
 
         # Train a simple classifier (SKLR) on the validation data to obtain predicted probabilities.
-        if debug:
-            print(f"[DEBUG bKairos.input_data] Training LogisticRegression...")
-            print(f"  x_valid shape for fit: {x_valid.shape}")
-            print(f"  y_valid_indices shape: {np.argmax(y_valid, axis=1).shape}")
-
         if self.lambda_weight == 1:
             self.r_train = torch.zeros(y_train.shape, dtype=torch.float32)
         else:
             y_valid_indices = np.argmax(y_valid, axis=1)
             self.classifier = SKLR(random_state=42)
-            try:
-                self.classifier.fit(x_valid, y_valid_indices)
-                if debug:
-                    print(f"  ✓ LogisticRegression trained successfully")
-            except Exception as e:
-                if debug:
-                    print(f"  ✗ Error training LogisticRegression: {e}")
-                raise
+            self.classifier.fit(x_valid, y_valid_indices)
             p_train = self.classifier.predict_proba(x_train)
 
             # Compute residuals for the training set: residual = y_true - y_pred.
@@ -256,7 +216,7 @@ class bKairos(DataEvaluator, ModelLessMixin):
 
         return avg_train, avg_valid
 
-    def train_data_values(self, *args, debug=None, **kwargs):
+    def train_data_values(self, *args, **kwargs):
         """
         Pre-compute the per-sample average RBF-kernel values using batched computation:
           - avg_K_train[i] = mean_j k(x_i, x_j)
@@ -265,43 +225,21 @@ class bKairos(DataEvaluator, ModelLessMixin):
         This batched version avoids constructing full kernel matrices and scales
         to larger datasets by processing samples in batches.
 
-        Parameters
-        ----------
-        debug : bool, optional
-            Override instance debug flag, by default None
-
         Returns
         -------
         bKairos
             Self for method chaining
         """
-        if debug is None:
-            debug = self.debug
-
-        if debug:
-            print(f"\n" + "="*70)
-            print(f"[bKairos] TRAINING PHASE - Batched Computation")
-            print(f"="*70)
-            print(f"  X_train shape: {self.X_train.shape}")
-            print(f"  X_valid shape: {self.X_valid.shape}")
-            print(f"  Batch size: {self.batch_size}")
-
         X = self.X_train        # (n_train, d) numpy array
         V = self.X_valid        # (n_valid, d) numpy array
         n_train = X.shape[0]
 
         # Compute or use provided bandwidth
         if self.sigma_feature is None and self.use_median_heuristic:
-            if debug:
-                print(f"  Computing Gaussian bandwidth via median heuristic...")
             sigma = self._compute_median_heuristic()
             self.sigma_feature = sigma
-            if debug:
-                print(f"  ✓ Computed sigma_feature = {sigma:.6f}")
         else:
             sigma = self.sigma_feature if self.sigma_feature is not None else 3.0
-            if debug:
-                print(f"  Using provided sigma_feature = {sigma:.6f}")
 
         # Initialize numpy arrays for efficient kernel computation
         avg_K_train = np.zeros(n_train, dtype=np.float32)
@@ -325,40 +263,19 @@ class bKairos(DataEvaluator, ModelLessMixin):
         self.avg_K_train = torch.tensor(avg_K_train, dtype=torch.float32)
         self.avg_K_valid = torch.tensor(avg_K_valid, dtype=torch.float32)
 
-        # feature discrepancy
+        # feature discrepancy: train - valid
         if self.unbiased:
             n = len(self.X_train)
             avg_K_train_unbiased = (self.avg_K_train * n - 1) / (n - 1)
-            feature_metric = self.avg_K_valid - avg_K_train_unbiased
+            feature_metric = avg_K_train_unbiased - self.avg_K_valid
         else:
-            feature_metric = self.avg_K_valid - self.avg_K_train
+            feature_metric = self.avg_K_train - self.avg_K_valid
 
         # squared residual term
         squared_residual = torch.sqrt((self.r_train ** 2).sum(dim=1))
 
         self.squared_residual = squared_residual
         self.feature_metric = feature_metric
-
-        if debug:
-            print(f"\n  [Feature Metric Statistics]")
-            print(f"    Mean:   {feature_metric.mean():.6f}")
-            print(f"    Std:    {feature_metric.std():.6f}")
-            print(f"    Min:    {feature_metric.min():.6f}")
-            print(f"    Max:    {feature_metric.max():.6f}")
-
-            print(f"\n  [Squared Residual Term Statistics]")
-            print(f"    Mean:   {squared_residual.mean():.6f}")
-            print(f"    Std:    {squared_residual.std():.6f}")
-            print(f"    Min:    {squared_residual.min():.6f}")
-            print(f"    Max:    {squared_residual.max():.6f}")
-
-            print(f"\n  [Combined Metric (current lambda={self.lambda_weight:.4f})]")
-            combined = self.lambda_weight * feature_metric + (1 - self.lambda_weight) * squared_residual
-            print(f"    Mean:   {combined.mean():.6f}")
-            print(f"    Std:    {combined.std():.6f}")
-            print(f"    Variance: {combined.var():.6f}")
-
-            print(f"\n" + "="*70)
 
         return self
 
@@ -398,11 +315,11 @@ class bKairos(DataEvaluator, ModelLessMixin):
         if lambda_weight is None:
             lambda_weight = self.lambda_weight
 
-        # feature discrepancy
+        # feature discrepancy: train - valid
         if self.unbiased:
-            feature_metric = self.avg_K_valid - (self.avg_K_train * len(self.X_train) - 1) / (len(self.X_train) - 1)
+            feature_metric = (self.avg_K_train * len(self.X_train) - 1) / (len(self.X_train) - 1) - self.avg_K_valid
         else:
-            feature_metric = self.avg_K_valid - self.avg_K_train
+            feature_metric = self.avg_K_train - self.avg_K_valid
 
         # squared residual term
         squared_residual = torch.sqrt((self.r_train ** 2).sum(dim=1))
