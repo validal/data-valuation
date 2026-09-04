@@ -2,36 +2,42 @@
 
 ### HIGH_CONFIG (high value)
 
-- **DOOB**: `num_models=5`, `proportion=0.1`  
-- **InfSub**: `num_models=500000`, `proportion=0.1`  
-- **DBanzhaf**: `num_models=100000`  
-- **DVRL**: `rl_epochs=5000`, `rl_batch_size=32`  
-- **DShapley**: `mc_epochs=1000`  
-- **KShapley**: `k_neighbors=50000`  
-- **AKShapley**: `k_neighbors=10`, `n_hash_table=100`, `eps=0.0001`, `alpha=0.5`  
-- **LAVA**: `lam_y=100`  
-- **SAVA**: `batch_size=1024`  
-- **AME**: `num_models=50000`  
+- **A-KShapley**: `dist_rand=7.3622`, `alpha=0.5`, `eps=0.001`, `k_neighbors=100`, `n_hash_table=100`, `t=2.399`  
+- **DOOB**: `num_models=100`, `proportion=1.0`  
+- **DShapley**: `mc_epochs=100`  
+- **DVRL**: `rl_epochs=3000`, `rl_batch_size=128`  
+- **InfSub**: `num_models=1000000`, `subset_size=16`  
+- **IR-DShapley**: `batch_size=10000`  
+- **Kairos**: `lambda_weight=0.97`  
+- **KShapley**: `k_neighbors=100`  
+- **LAVA**: `lam_y=100.0`  
+- **LoGra-NR**: `lora=none`, `hessian=raw`  
+- **LoGra-PK**: `lora=pca`, `hessian=kfac`  
 - **LOO**  
-- **Rand**
+- **Rand**  
+- **SAVA**: `lam_y=10.0`  
 
 ---
 
 ### LOW_CONFIG (low value)
 
-- **DOOB**: `num_models=5`, `proportion=0.1`  
-- **InfSub**: `num_models=1000000`, `proportion=0.001`  
-- **DBanzhaf**: `num_models=50000`  
-- **DVRL**: `rl_epochs=5000`, `rl_batch_size=32`  
-- **DShapley**: `mc_epochs=1000`  
-- **KShapley**: `k_neighbors=10`  
-- **AKShapley**: `k_neighbors=10`, `n_hash_table=100`, `eps=0.0001`, `alpha=0.5`  
-- **LAVA**: `lam_y=10`  
-- **SAVA**: `batch_size=1024`  
-- **AME**: `num_models=50000`  
+- **A-KShapley**: `dist_rand=7.3622`, `alpha=0.5`, `eps=0.001`, `k_neighbors=100`, `n_hash_table=100`, `t=2.399`  
+- **DOOB**: `num_models=100`, `proportion=1.0`  
+- **DShapley**: `mc_epochs=100`  
+- **DVRL**: `rl_epochs=10000`, `rl_batch_size=64`  
+- **InfSub**: `num_models=1000000`, `subset_size=16`  
+- **IR-DShapley**: `batch_size=1024`  
+- **Kairos**: `lambda_weight=0.97`  
+- **KShapley**: `k_neighbors=100`  
+- **LAVA**: `lam_y=10.0`  
+- **LoGra-NR**: `lora=none`, `hessian=raw`  
+- **LoGra-PK**: `lora=pca`, `hessian=kfac`  
 - **LOO**  
-- **Rand**
+- **Rand**  
+- **SAVA**: `lam_y=10.0`  
 
 ---
 
+### Note
 
+Plots in `evaluation/` (`high_value_removal.pdf`, `low_value_removal.pdf`, `mislabeled_detection.pdf`) correspond to the high- and low-value configurations above.
