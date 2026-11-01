@@ -1,0 +1,1806 @@
+#!/usr/bin/env python3
+"""
+H100-Optimized CIFAR10 + MLP (CifarMLP) Data Valuation Experiment (Unified Pipeline)
+
+Clone of the Resnet9 pipeline using CifarMLP (Flatten-3072-615-615-10, same param count as ResNet9) with the same training recipe.
+All models use identical H100-optimized training hyperparameters for fair comparison.
+
+Key H100 Optimizations:
+  ✓ torch.compile with 'reduce-overhead' mode for kernel fusion
+  ✓ Automatic Mixed Precision (bfloat16) autocast + GradScaler
+  ✓ CosineAnnealingLR scheduler (smooth decay over 100 epochs)
+  ✓ Adam optimizer with LR=0.001 (adaptive learning rates)
+  ✓ Channels-last memory format (NHWC layout)
+  ✓ Large batch size (1024) with GPU memory optimization
+  ✓ Gradient clipping for training stability
+  ✓ Persistent workers + pinned memory in DataLoader
+  ✓ Unified configuration (all models use same hyperparams)
+
+Usage Examples:
+  # CifarMLP with LoGRA
+  python run_cifar10_mlp_dataval.py --model cifarmlp --cuda 0 --seed 42 --method LoGRA
+  
+  # ResNet-50 with full evaluation
+  python run_cifar10_mlp_dataval.py --model resnet50 --cuda 0 --seed 42 --method ALL
+  
+  # ResNet-110 with InRunDataShapleyGhost
+  python run_cifar10_mlp_dataval.py --model rn110 --cuda 0 --seed 42 --method InRunDataShapleyGhost
+
+Updated: 2026-07-29
+Scalability Study: Fair comparison across model depths with H100 optimizations
+"""
+
+import os
+os.environ['OPENBLAS_CORETYPE'] = 'NEHALEM'
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_THREADING_LAYER'] = 'GNU'
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from pathlib import Path
+import argparse
+import time
+import json
+import sys
+import logging
+import psutil
+import tracemalloc
+import threading
+from typing import Optional, Dict, Any
+
+# Add parent directory to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Import unified config
+try:
+    from unified_config import get_training_config, print_training_config
+    UNIFIED_CONFIG_AVAILABLE = True
+except ImportError:
+    print("⚠ unified_config.py not found in parent directory")
+    UNIFIED_CONFIG_AVAILABLE = False
+
+# Add comprehensive profiler
+sys.path.insert(0, str(Path(__file__).parent.parent))
+try:
+    from comprehensive_profiler import ComprehensiveProfiler
+    PROFILER_AVAILABLE = True
+except ImportError:
+    print("⚠ comprehensive_profiler not found, skipping profiling")
+    PROFILER_AVAILABLE = False
+
+# opendataval imports
+from opendataval.dataloader import mix_labels
+from opendataval.dataval import (
+    AME, DVRL, BetaShapley, DataBanzhaf, DataOob, DataShapley,
+    InfluenceSubsample, KNNShapley, LeaveOneOut, RandomEvaluator,
+    LoGRA, InfluenceFunction, InRunDataShapleyGhost
+)
+from opendataval.dataval.knnshap import KNNShapleyLSH, KNNShapleyVec, AKShapleyGPU
+from opendataval.dataval.lava import LavaEvaluator, SavaEvaluator
+from opendataval.dataval.influence.infsub_ckpt import InfluenceSubsampleCKPT
+from opendataval.dataval.oob.dataoob_ckpt import DataOobCKPT
+from opendataval.dataval.influence.inrun_shapley_ckpt import InRunShapleyCKPT
+from opendataval.experiment import ExperimentMediator
+from opendataval.experiment.exper_methods import (
+    discover_corrupted_sample, noisy_detection, remove_high_low, save_dataval
+)
+
+def _class_ids(labels):
+    """Convert scalar or one-hot labels to one-dimensional class IDs."""
+    labels = np.asarray(labels)
+    if labels.ndim > 1 and labels.shape[1] > 1:
+        return np.argmax(labels, axis=1)
+    return labels.reshape(-1)
+
+
+def mix_labels_and_print_distribution(
+    fetcher, noise_rate=0.2, rng=None, noise_random_state=None
+):
+    """Inject label noise and print its per-class distribution."""
+    clean_labels = _class_ids(np.asarray(fetcher.y_train).copy())
+    noise_updates = mix_labels(
+        fetcher,
+        noise_rate=noise_rate,
+        rng=rng,
+        noise_random_state=noise_random_state,
+    )
+    noisy_labels = _class_ids(noise_updates["y_train"])
+    noisy_indices = np.asarray(noise_updates["noisy_train_indices"], dtype=int)
+
+    selected = np.zeros(len(clean_labels), dtype=bool)
+    selected[noisy_indices] = True
+    classes = np.unique(clean_labels)
+
+    print("\n[Noise] Training-label distribution by source class:")
+    print("  class | noisy / total | class noise rate | noisy-label destinations")
+    for class_id in classes:
+        class_mask = clean_labels == class_id
+        class_noisy = class_mask & selected
+        total_count = int(class_mask.sum())
+        noisy_count = int(class_noisy.sum())
+        class_rate = 100.0 * noisy_count / total_count if total_count else 0.0
+
+        targets, target_counts = np.unique(
+            noisy_labels[class_noisy], return_counts=True
+        )
+        transitions = ", ".join(
+            f"{target}: {count}"
+            for target, count in zip(targets.tolist(), target_counts.tolist())
+        )
+        print(
+            f"  {str(class_id):>5} | {noisy_count:>5} / {total_count:<5} | "
+            f"{class_rate:>15.2f}% | {transitions or '-'}"
+        )
+
+    overall_rate = 100.0 * len(noisy_indices) / len(clean_labels)
+    print(
+        f"  Total noisy training labels: {len(noisy_indices)}/{len(clean_labels)} "
+        f"({overall_rate:.2f}%)\n"
+    )
+    return noise_updates
+
+
+# Optional imports
+try:
+    from opendataval.dataval.kairos.bkairos import bKairos
+    from opendataval.dataval.kairos.kairos import Kairos
+    from opendataval.dataval.kairos.kairosgpu import KairosGPU
+    from opendataval.dataval.kairos.kmm import KMM
+    from opendataval.dataval.kairos.knnoutlier import KNNOutlier
+    from opendataval.dataval.kairos.knnconsistency import KNNConsistency
+    KAIROS_AVAILABLE = True
+except (ImportError, AttributeError):
+    KAIROS_AVAILABLE = False
+
+try:
+    from ghostEngines import GradDotProdEngine
+    GHOSTENGINES_AVAILABLE = True
+except ImportError:
+    GHOSTENGINES_AVAILABLE = False
+
+try:
+    import logix
+    LOGIX_AVAILABLE = True
+except ImportError:
+    LOGIX_AVAILABLE = False
+
+print(f"✓ Framework Status: GhostSuite={GHOSTENGINES_AVAILABLE}, LogIX={LOGIX_AVAILABLE}, Kairos={KAIROS_AVAILABLE}, UnifiedConfig={UNIFIED_CONFIG_AVAILABLE}")
+
+
+# ============================================================================
+# UTILITY CLASSES
+# ============================================================================
+
+class MemoryTracker:
+    """Conference-standard memory and timing measurement (ICML/NeurIPS/ICLR methodology).
+
+    Reports incremental resource consumption relative to baseline, excluding:
+    - Pre-existing GPU allocations (other processes, CUDA contexts, caching)
+    - Framework initialization overhead
+    - Unrelated background processes
+
+    Methodology:
+    - GPU: Process-level torch.cuda.* APIs (not nvidia-smi)
+    - CPU: Per-process RSS (psutil), not system-wide memory
+    - Report: ΔMemory = PeakMemory - BaselineMemory
+    """
+
+    def __init__(self):
+        self.start_time = None
+        self.end_time = None
+        self.baseline_cpu_rss_mb = None
+        self.baseline_gpu_allocated_mb = None
+        self.baseline_gpu_reserved_mb = None
+        self.process = psutil.Process(os.getpid())
+
+    def start(self):
+        """Establish baseline by synchronizing, clearing cache, and recording current state.
+
+        This should be called after all initialization (data loading, model setup, etc)
+        and immediately before the method under evaluation begins.
+        """
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+
+        self.start_time = time.time()
+
+        # Baseline CPU: Current process RSS only (per-process, not system-wide)
+        self.baseline_cpu_rss_mb = self.process.memory_info().rss / 1024 / 1024
+
+        # Baseline GPU: Current allocated and reserved (will subtract from peak)
+        if torch.cuda.is_available():
+            self.baseline_gpu_allocated_mb = torch.cuda.memory_allocated() / 1024 / 1024
+            self.baseline_gpu_reserved_mb = torch.cuda.memory_reserved() / 1024 / 1024
+        else:
+            self.baseline_gpu_allocated_mb = 0
+            self.baseline_gpu_reserved_mb = 0
+
+    def end(self):
+        """Stop tracking and return DELTA metrics (peak - baseline).
+
+        Reports only the incremental memory used by the method, not absolute device usage.
+        Synchronizes GPU to ensure all operations complete before measurement.
+        """
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        self.end_time = time.time()
+        elapsed_seconds = self.end_time - self.start_time
+
+        # Peak memory stats during execution (process-level only)
+        peak_gpu_allocated_mb = torch.cuda.max_memory_allocated() / 1024 / 1024 if torch.cuda.is_available() else 0
+        peak_gpu_reserved_mb = torch.cuda.max_memory_reserved() / 1024 / 1024 if torch.cuda.is_available() else 0
+
+        # Current process RSS (may be higher than baseline if process acquired additional memory)
+        current_cpu_rss_mb = self.process.memory_info().rss / 1024 / 1024
+
+        # Delta metrics: What the method actually consumed
+        delta_cpu_mb = current_cpu_rss_mb - self.baseline_cpu_rss_mb
+        delta_gpu_allocated_mb = peak_gpu_allocated_mb - self.baseline_gpu_allocated_mb
+        delta_gpu_reserved_mb = peak_gpu_reserved_mb - self.baseline_gpu_reserved_mb
+
+        return {
+            'elapsed_seconds': elapsed_seconds,
+            'elapsed_formatted': self._format_time(elapsed_seconds),
+            # Baseline (reference point, recorded before experiment)
+            'baseline_cpu_rss_mb': self.baseline_cpu_rss_mb,
+            'baseline_gpu_allocated_mb': self.baseline_gpu_allocated_mb,
+            'baseline_gpu_reserved_mb': self.baseline_gpu_reserved_mb,
+            # Peak during execution (process-level)
+            'peak_cpu_rss_mb': current_cpu_rss_mb,
+            'peak_gpu_allocated_mb': peak_gpu_allocated_mb,
+            'peak_gpu_reserved_mb': peak_gpu_reserved_mb,
+            # REPORTED METRICS: Incremental consumption (Δ = Peak - Baseline)
+            'delta_cpu_mb': delta_cpu_mb,
+            'delta_gpu_allocated_mb': delta_gpu_allocated_mb,
+            'delta_gpu_reserved_mb': delta_gpu_reserved_mb,
+        }
+
+    @staticmethod
+    def _format_time(seconds):
+        hours, remainder = divmod(seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        return f"{int(hours)}h {int(minutes)}m {secs:.1f}s"
+
+
+def format_memory_report(stats, phase_name=""):
+    """Format memory metrics in conference-standard style (baseline | peak | delta).
+
+    Reports incremental consumption (Δ = peak - baseline), excluding pre-existing allocations.
+    """
+    baseline_cpu = stats.get('baseline_cpu_rss_mb', 0)
+    peak_cpu = stats.get('peak_cpu_rss_mb', 0)
+    delta_cpu = stats.get('delta_cpu_mb', 0)
+
+    baseline_gpu_alloc = stats.get('baseline_gpu_allocated_mb', 0)
+    peak_gpu_alloc = stats.get('peak_gpu_allocated_mb', 0)
+    delta_gpu_alloc = stats.get('delta_gpu_allocated_mb', 0)
+
+    baseline_gpu_resv = stats.get('baseline_gpu_reserved_mb', 0)
+    peak_gpu_resv = stats.get('peak_gpu_reserved_mb', 0)
+    delta_gpu_resv = stats.get('delta_gpu_reserved_mb', 0)
+
+    lines = []
+    if phase_name:
+        lines.append(f"\n[{phase_name}]")
+    lines.append(f"  CPU RSS:        Baseline={baseline_cpu:.1f}MB → Peak={peak_cpu:.1f}MB | Δ={delta_cpu:+.1f}MB")
+    lines.append(f"  GPU Allocated:  Baseline={baseline_gpu_alloc:.1f}MB → Peak={peak_gpu_alloc:.1f}MB | Δ={delta_gpu_alloc:+.1f}MB")
+    lines.append(f"  GPU Reserved:   Baseline={baseline_gpu_resv:.1f}MB → Peak={peak_gpu_resv:.1f}MB | Δ={delta_gpu_resv:+.1f}MB")
+    return "\n".join(lines)
+
+
+class DualWriter:
+    """Write to both file and console."""
+    def __init__(self, file_obj, console_obj):
+        self.file = file_obj
+        self.console = console_obj
+
+    def write(self, message):
+        self.file.write(message)
+        self.file.flush()
+        self.console.write(message)
+        self.console.flush()
+
+    def flush(self):
+        self.file.flush()
+        self.console.flush()
+
+    def isatty(self):
+        return self.console.isatty()
+
+
+# ============================================================================
+# SETUP & LOGGING
+# ============================================================================
+
+def setup_logging(method_name, seed, logs_base="./logs", timestamp_str=None):
+    """Setup logging to file and console."""
+    logs_base_str = str(logs_base)
+
+    # RUNNER_LOG_FILE (set by submit.sh) pins the logger file to one exact path
+    if os.environ.get("RUNNER_LOG_FILE"):
+        log_file = Path(os.environ["RUNNER_LOG_FILE"])
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_dir = log_file.parent
+    # If path already contains method_name and seed_N, use it directly (avoid double nesting)
+    elif method_name in logs_base_str and f"seed_{seed}" in logs_base_str:
+        log_dir = Path(logs_base)
+    elif timestamp_str:
+        log_dir = Path(logs_base) / f"{method_name}_{timestamp_str}" / f"seed_{seed}"
+    else:
+        log_dir = Path(logs_base) / method_name / f"seed_{seed}"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    if not os.environ.get("RUNNER_LOG_FILE"):
+        log_file = log_dir / f"{method_name}_seed_{seed}.log"
+    log_file_obj = open(log_file, 'w')
+
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+
+    sys.stdout = DualWriter(log_file_obj, original_stdout)
+    sys.stderr = DualWriter(log_file_obj, original_stderr)
+
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.DEBUG)
+
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    file_handler = logging.FileHandler(log_file, mode='a')
+    file_handler.setLevel(logging.DEBUG)
+
+    console_handler = logging.StreamHandler(original_stdout)
+    console_handler.setLevel(logging.INFO)
+
+    formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    return logger, log_file
+
+
+def get_evaluator_suffix(evaluator):
+    """Generate parameter suffix from evaluator config."""
+    import re
+    evaluator_str = str(evaluator)
+    params = []
+
+    # Extract patterns for different evaluator types
+    if "InfluenceSubsample" in evaluator_str:
+        if (m := re.search(r'num_models=(\d+)', evaluator_str)):
+            params.append(f"m{m.group(1)}")
+        if (m := re.search(r'subset_size=(\d+)', evaluator_str)):
+            params.append(f"ss{m.group(1)}")
+        elif (m := re.search(r'proportion=([0-9.]+)', evaluator_str)):
+            params.append(f"p{m.group(1)}")
+    elif "DataOob" in evaluator_str:
+        if (m := re.search(r'num_models=(\d+)', evaluator_str)):
+            params.append(f"m{m.group(1)}")
+        if (m := re.search(r'proportion=([0-9.]+)', evaluator_str)):
+            params.append(f"p{m.group(1)}")
+    elif "KNNShapley" in evaluator_str:
+        if (m := re.search(r'k_neighbors=(\d+)', evaluator_str)):
+            params.append(f"k{m.group(1)}")
+    elif "DataShapley" in evaluator_str:
+        if (m := re.search(r'mc_epochs=(\d+)', evaluator_str)):
+            params.append(f"mc{m.group(1)}")
+    elif "BetaShapley" in evaluator_str or "DataBanzhaf" in evaluator_str:
+        if (m := re.search(r'num_models=(\d+)', evaluator_str)):
+            params.append(f"m{m.group(1)}")
+    elif "DVRL" in evaluator_str:
+        if (m := re.search(r'rl_epochs=(\d+)', evaluator_str)):
+            params.append(f"e{m.group(1)}")
+        if (m := re.search(r'rl_batch_size=(\d+)', evaluator_str)):
+            params.append(f"b{m.group(1)}")
+    elif "LAVA" in evaluator_str or "SAVA" in evaluator_str:
+        if (m := re.search(r'lam_y=([0-9.]+)', evaluator_str)):
+            params.append(f"lam{m.group(1)}")
+    elif "LoGRA" in evaluator_str:
+        if (m := re.search(r"lora='([^']+)'", evaluator_str)):
+            params.append(f"lora{m.group(1)}")
+        if (m := re.search(r"hessian='([^']+)'", evaluator_str)):
+            params.append(f"hess{m.group(1)}")
+    elif "InRunDataShapleyGhost" in evaluator_str:
+        if (m := re.search(r'batch_size=(\d+)', evaluator_str)):
+            params.append(f"b{m.group(1)}")
+
+    return "_".join(params) if params else "default"
+
+
+def set_global_seeds(seed):
+    """Set all global random seeds for reproducibility."""
+    print(f"[Seeding] Setting global seeds to {seed}")
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# ============================================================================
+# EXPERIMENT SETUP
+# ============================================================================
+
+def get_unified_train_kwargs(model_name: str) -> Dict[str, Any]:
+    """Get unified training kwargs for the model.
+    
+    If unified_config is available, use it. Otherwise, use sensible defaults.
+    """
+    # if UNIFIED_CONFIG_AVAILABLE:
+    #     return get_training_config(model_name)
+    
+    # Fallback configuration (all models use these settings)
+    default_config = {
+        "epochs": 50,
+        "batch_size": 1024,
+        "lr": 0.0028,
+        "weight_decay": 5e-4,
+        "label_smoothing": 0.0,
+        "scheduler": "cosine",
+    }
+
+    return default_config
+
+
+def create_experiment_mediator(
+    model_name: str,
+    seed: int,
+    cuda_device: int,
+    train_count: int = 40000,
+    valid_count: int = 10000,
+    test_count: int = 10000,
+    noise_rate: float = 0.2,
+):
+    """Create ExperimentMediator with H100-optimized unified config."""
+    print(f"\n[Setup] Creating CIFAR10 {model_name} experiment (H100-Optimized)...")
+    set_global_seeds(seed)
+
+    dataset_name = "cifar10"
+    metric_name = "accuracy"
+
+    # Get unified training configuration
+    TRAIN_KWARGS = get_unified_train_kwargs(model_name)
+
+    device = f'cuda:{cuda_device}' if torch.cuda.is_available() else 'cpu'
+    print(f"  Dataset: {dataset_name}, Model: {model_name}")
+    print(f"  Splits: {train_count}/{valid_count}/{test_count}, Noise: {noise_rate}")
+    print(f"  Device: {device}")
+    print(f"  H100-Optimized Training Config:")
+    print(f"    - Epochs: {TRAIN_KWARGS['epochs']}")
+    print(f"    - Batch Size: {TRAIN_KWARGS['batch_size']}")
+    print(f"    - Learning Rate: {TRAIN_KWARGS['lr']}")
+    print(f"    - Weight Decay: {TRAIN_KWARGS['weight_decay']}")
+    print(f"    - Label Smoothing: {TRAIN_KWARGS['label_smoothing']}")
+
+    exper_med = ExperimentMediator.model_factory_setup(
+        dataset_name=dataset_name,
+        cache_dir="./data_files/",
+        force_download=False,
+        train_count=train_count,
+        valid_count=valid_count,
+        test_count=test_count,
+        add_noise=mix_labels_and_print_distribution,
+        noise_kwargs={'noise_rate': noise_rate},
+        train_kwargs=TRAIN_KWARGS,
+        model_name=model_name,
+        metric_name=metric_name,
+        train_validation_model=False,
+        train_baseline_model=False,  # ✅ Train baseline ResNet at the beginning
+        random_state=seed,
+        device=device
+    )
+
+    print(f"✓ Checkpoints created: {len(exper_med.get_checkpoints())}")
+    # Store data size for profiling
+    exper_med._train_count = train_count
+    return exper_med
+
+
+# ============================================================================
+# CifarMLP (self-contained; registered into opendataval's ModelFactory at import)
+# ============================================================================
+
+from opendataval.model.resnet import ResNetBase  # reuse ResNet9's fit/predict (Adam, cosine, bf16 AMP, clip)
+import opendataval.experiment.api as _ode_api
+
+
+class CifarMLP(ResNetBase):
+    """Flatten -> Linear(3072,h) -> ReLU -> Linear(h,h) -> ReLU -> Linear(h,C), h=615 -> 2,274,895 params (ResNet9 has 2,274,880). Raw logits."""
+
+    def __init__(self, num_classes=10, in_dim=3072, hidden_dim=615):
+        super().__init__(num_classes)
+        self.model = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(in_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, num_classes),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+    def fit(self, x_train, y_train, *args, sample_weight=None, **kwargs):
+        # ResNetBase.fit swallows sample_weight in **kwargs, so DVRL's selection had no effect on its reward.
+        # DVRL weights are Bernoulli 0/1, so training on the selected subset is exactly the weighted fit.
+        if sample_weight is not None:
+            keep = torch.as_tensor(sample_weight).reshape(-1) > 0
+            x_train, y_train = x_train[keep.to(x_train.device)], y_train[keep.to(y_train.device)]
+        return super().fit(x_train, y_train, *args, **kwargs)
+
+    def state_dict(self, destination=None, prefix='', keep_vars=False):
+        return self.model.state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
+
+    def load_state_dict(self, state_dict, strict=True):
+        return self.model.load_state_dict(state_dict, strict=strict)
+
+
+_orig_model_factory = _ode_api.ModelFactory
+
+
+def _model_factory_with_mlp(model_name, fetcher=None, device=torch.device("cpu"), *args, **kwargs):
+    if isinstance(model_name, str) and model_name.lower() in ("cifarmlp", "cmlp"):
+        return CifarMLP(num_classes=10).to(device)
+    return _orig_model_factory(model_name, fetcher, device, *args, **kwargs)
+
+
+_ode_api.ModelFactory = _model_factory_with_mlp
+
+
+def train_embedding_checkpoint(path="./checkpoints/validation_model/model.pth"):
+    """Train the CifarMLP embedding checkpoint (same fit recipe) on the first 40000 CIFAR-10 train images."""
+    from torchvision import datasets, transforms
+    tf = transforms.Compose([transforms.ToTensor(),
+                             transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))])
+    tr = datasets.CIFAR10("./data_files/cifar10", train=True, download=False, transform=tf)
+    te = datasets.CIFAR10("./data_files/cifar10", train=False, download=False, transform=tf)
+    x = torch.stack([tr[i][0] for i in range(40000)]); y = torch.tensor([tr[i][1] for i in range(40000)])
+    xt = torch.stack([te[i][0] for i in range(10000)]); yt = torch.tensor([te[i][1] for i in range(10000)])
+    set_global_seeds(0)
+    dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    m = CifarMLP(num_classes=10).to(dev)
+    kw = get_unified_train_kwargs("cifarmlp")
+    m.fit(x, y, x_test=xt, y_test=yt, batch_size=kw["batch_size"], epochs=kw["epochs"], lr=kw["lr"],
+          weight_decay=kw["weight_decay"], label_smoothing=kw["label_smoothing"])
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(m.state_dict(), path)
+    print(f"✓ Saved embedding checkpoint: {path}")
+
+
+def create_embedding_model():
+    """Create H100-optimized embedding model with feature extraction."""
+    if not os.path.exists("./checkpoints/validation_model/model.pth"):
+        print("[Embedding] checkpoint missing -> training CifarMLP embedding model")
+        train_embedding_checkpoint()
+
+    embedding_model = CifarMLP(num_classes=10)
+    embedding_model.load_state_dict(
+        torch.load("./checkpoints/validation_model/model.pth", map_location="cpu")
+    )
+
+    # Drop the final classifier Linear -> 512-d penultimate (post-ReLU) features
+    embedding_model.model[-1] = nn.Identity()
+
+    # H100 optimizations for embedding extraction
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    embedding_model = embedding_model.to(device)
+
+    # Apply torch.compile for faster inference
+    try:
+        embedding_model = torch.compile(embedding_model, mode='reduce-overhead', fullgraph=False)
+        compile_status = "✓ torch.compile enabled"
+    except Exception as e:
+        compile_status = f"⚠ torch.compile failed: {e}"
+
+    embedding_model.eval()
+
+    # H100-optimized predict: larger batch processing, GPU-resident
+    def embedding_predict(x):
+        device = next(embedding_model.parameters()).device
+        embedding_model.eval()
+
+        # Convert numpy to tensor (always float32)
+        if not isinstance(x, torch.Tensor):
+            x = torch.tensor(x, dtype=torch.float32)
+
+        with torch.no_grad():
+            # Keep on GPU, torch.compile handles optimization
+            x = x.to(device)
+            embeddings = embedding_model.forward(x)
+            # Return as numpy (required by embeddings pipeline)
+            return embeddings.cpu().numpy()
+
+    embedding_model.predict = embedding_predict
+    print(f"✓ Embedding model loaded (CifarMLP, 615-dim) {compile_status}")
+    print(f"  Device: {device}")
+    print(f"  Batch processing: 1024 samples/batch with H100 acceleration")
+    return embedding_model
+
+
+
+def create_imagenet_embedding_model(device=None, renorm=True):
+    """ImageNet-pretrained ResNet18 used as a frozen feature extractor (512-d).
+
+    Mirrors the torchvision path in the reference script:
+        model = models.resnet18(pretrained=True)
+        model.fc = torch.nn.Identity()
+
+    Note on preprocessing: opendataval delivers CIFAR-normalised 32x32 tensors
+    (mean 0.4914/0.4822/0.4465, std 0.2470/0.2435/0.2616). This network was
+    trained on ImageNet statistics, so we undo the CIFAR normalisation and
+    re-apply the ImageNet one before the forward pass.
+    """
+    import torchvision.models as tvm
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    net = tvm.resnet18(weights=tvm.ResNet18_Weights.IMAGENET1K_V1)
+    net.fc = nn.Identity()
+    net = net.to(device).eval()
+    for prm in net.parameters():
+        prm.requires_grad = False
+
+    _CIFAR_MEAN = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1).to(device)
+    _CIFAR_STD  = torch.tensor([0.2470, 0.2435, 0.2616]).view(1, 3, 1, 1).to(device)
+    _IN_MEAN    = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
+    _IN_STD     = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
+
+    def embedding_predict(x):
+        if not isinstance(x, torch.Tensor):
+            x = torch.tensor(np.array(x), dtype=torch.float32)
+        x = x.to(device).float()
+        if x.dim() == 2:
+            x = x.view(-1, 3, 32, 32)
+        with torch.no_grad():
+            if renorm:
+                raw = x * _CIFAR_STD + _CIFAR_MEAN      # back to [0,1]
+                inp = (raw - _IN_MEAN) / _IN_STD        # ImageNet statistics
+            else:
+                inp = x                                 # script-matching: CIFAR stats as-is
+            return net(inp).cpu().numpy()
+
+    net.predict = embedding_predict
+    print(f"✓ Embedding model loaded (torchvision ResNet18, ImageNet-pretrained, 512-dim) renorm={renorm}")
+    print(f"  Device: {device}  |  CIFAR->ImageNet normalisation applied")
+    return net
+
+
+def create_method_evaluators(method_name, seed, embedding_model=None, val_batch_size=128, proportion=0.7, subset_size=None, num_models=100, checkpoint_models=None, lam_y=5.0, lam_x=1.0, k_neighbors=10, lambda_weight=0.97, kmm_B=10.0, kmm_sigma_scale=0.25, kmm_ridge=1.0, kmm_max_iter=5000, knno_k=10, knno_class_conditional=True, knno_ref='valid', knnc_k=10, valid_chunk=512, sava_batch_size=1024, dist_rand=7.3622, lsh_t=2.399, n_hash_table=100, lsh_eps=1e-2):
+    """Create evaluators for specified method using unified config."""
+    print(f"\n[Methods] Creating {method_name} evaluators...")
+
+    if method_name in ("DataOob", "DOOB"):
+        evaluators = [
+            DataOobCKPT(
+                num_models=num_models,
+                proportion=proportion,
+                checkpoint_models=checkpoint_models if checkpoint_models else [1,5,10,50],
+                random_state=seed,
+                verbose=True
+            )
+        ]
+
+    elif method_name == "LOO_Random":
+        evaluators = [RandomEvaluator(random_state=seed)]
+
+    elif method_name == "KNNShapley":
+        evaluators = [
+            KNNShapley(k_neighbors=k_neighbors, embedding_model=embedding_model, random_state=seed)
+        ]
+
+    elif method_name == "KNNShapleyVec":
+        evaluators = [
+            KNNShapleyVec(k_neighbors=k_neighbors, valid_chunk=valid_chunk, embedding_model=embedding_model, random_state=seed, debug=True)
+        ]
+
+    elif method_name == "AKShapleyGPU":
+        # GPU-resident AKShapley. Same LSH approximation as the KNNShapleyLSH
+        # branch below: candidate sets, neighbour order and the label-match
+        # matrix are identical, values agree to ~1 ULP.
+        # eps sets the retrieval depth K_star = max(k_neighbors, ceil(1/eps)):
+        # eps>=1e-3 gives K_star=1000 (so eps does not vary the result once
+        # dist_rand and t are pinned), eps=1e-4 gives K_star=10000.
+        evaluators = [
+            AKShapleyGPU(
+                k_neighbors=1000,
+                dist_rand=(dist_rand if dist_rand > 0 else None),
+                n_hash_table=n_hash_table,
+                eps=lsh_eps,
+                alpha=0.5,
+                t=(lsh_t if lsh_t > 0 else None),
+                valid_chunk=valid_chunk,
+                embedding_model=embedding_model,
+                random_state=seed,
+                debug=True,
+            )
+        ]
+
+    elif method_name == "AKShapley":
+        evaluators = [
+            KNNShapleyLSH(
+                k_neighbors=1000,
+                dist_rand=7.3622,
+                n_hash_table=100,
+                eps=eps,
+                alpha=0.5,
+                t=2.399,
+                embedding_model=embedding_model,
+                random_state=seed
+            )
+            for eps in [1e-3, 1e-2]
+        ]
+
+    elif method_name == "DataShapley":
+        evaluators = [DataShapley(mc_epochs=mc, min_cardinality=5, random_state=seed) for mc in [100]]
+
+    elif method_name == "BetaShapley":
+        evaluators = [BetaShapley(num_models=m, random_state=seed) for m in [100, 500, 1000]]
+
+    elif method_name == "DataBanzhaf":
+        evaluators = [DataBanzhaf(num_models=m, random_state=seed) for m in [100, 500, 1000]]
+
+    elif method_name == "InfluenceSubsample":
+        evaluators = [
+            InfluenceSubsampleCKPT(
+                num_models=100,
+                subset_size=subset_size,
+                checkpoint_models=[1, 50, 100],
+                random_state=seed+1,  # Decorelated: fetcher uses seed, method uses seed+1 to prevent leakage
+                verbose=True,
+            )
+        ]
+
+    elif method_name == "AME":
+        evaluators = [AME(num_models=m, random_state=seed) for m in [100000]]
+
+    elif method_name == "DVRL":
+        evaluators = [DVRL(rl_epochs=e, rl_batch_size=b, random_state=seed) for e in [1000] for b in [20000]]
+
+    elif method_name == "LAVA":
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # lava.py:162 does a bare truthiness check on embedding_model. A torch.compile'd
+        # OptimizedModule forwards __len__ to the wrapped module, and ResNet9 has no
+        # __len__, so bool() raises TypeError and opendataval silently drops the
+        # evaluator (empty CSVs). Pass the uncompiled module instead.
+        lava_embedding_model = getattr(embedding_model, "_orig_mod", embedding_model)
+        evaluators = [
+            LavaEvaluator(blur=0.05, debug=True, lam_x=lam_x, lam_y=lam_y, embedding_model=lava_embedding_model, random_state=seed, device=device)
+        ]
+
+    elif method_name == "SAVA":
+        evaluators = [
+            SavaEvaluator(
+                batch_size=sava_batch_size,
+                lam_x=lam_x,
+                lam_y=lam_y,
+                p=2,
+                blur=0.05,
+                mode="cls",
+                debug=True,
+                embedding_model=embedding_model,
+                random_state=seed,
+                device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
+                stratified_batches=True
+            )
+        ]
+
+    elif method_name == "InRunDataShapleyGhost":
+        TRAIN_KWARGS = get_unified_train_kwargs("cifarmlp")
+        # Use unified scheduler configuration
+        scheduler_type = TRAIN_KWARGS.get("scheduler", "cosine")
+        scheduler_params = TRAIN_KWARGS.get("scheduler_params", {"step_size": 30, "gamma": 0.1})
+
+        evaluators = [
+            InRunDataShapleyGhost(
+                epochs=TRAIN_KWARGS["epochs"],
+                batch_size=TRAIN_KWARGS["batch_size"],
+                learning_rate=TRAIN_KWARGS["lr"],
+                weight_decay=0.0,  # main fit() applies no weight decay; match it so the scored model is trained the same way
+                val_batch_size=val_batch_size,
+                dynamic_val_batch=True,
+                scheduler_type=scheduler_type,  # Use cosine or step from unified config
+                step_size=scheduler_params.get("step_size", 30),
+                step_gamma=scheduler_params.get("gamma", 0.1),
+                random_state=seed,
+                verbose=True,
+                save_plots=True,
+            )
+        ]
+
+    elif method_name == "LoGRA":
+        TRAIN_KWARGS = get_unified_train_kwargs("cifarmlp")
+        # Use unified scheduler configuration (cosine or step)
+        scheduler_type = TRAIN_KWARGS.get("scheduler", "cosine")
+        scheduler_params = TRAIN_KWARGS.get("scheduler_params", {"step_size": 30, "gamma": 0.1})
+
+        evaluators = [
+            LoGRA(
+                lora="pca",
+                hessian="kfac",
+                epochs=TRAIN_KWARGS["epochs"],
+                batch_size=TRAIN_KWARGS["batch_size"],
+                learning_rate=TRAIN_KWARGS["lr"],
+                weight_decay=0.0,  # main fit() applies no weight decay; match it so the scored model is trained the same way
+                scheduler_type=scheduler_type,  # Use cosine or step from unified config
+                step_size=scheduler_params.get("step_size", 30),  # For StepLR
+                step_gamma=scheduler_params.get("gamma", 0.1),  # For StepLR (correct parameter name)
+                random_state=seed,
+                verbose=True
+            )
+        ]
+
+    elif method_name == "Kairos":
+        if not KAIROS_AVAILABLE:
+            print("⚠ Kairos not available, skipping")
+            return []
+        evaluators = [
+            Kairos(
+                lambda_weight=lambda_weight,
+                unbiased=True,
+                use_median_heuristic=True,
+                num_samples=10000,
+                embedding_model=embedding_model,
+                random_state=seed,
+                debug=True
+            )
+        ]
+
+    elif method_name == "KairosGPU":
+        if not KAIROS_AVAILABLE:
+            print("⚠ Kairos not available, skipping")
+            return []
+        evaluators = [
+            KairosGPU(
+                lambda_weight=lambda_weight,
+                unbiased=True,
+                use_median_heuristic=True,
+                num_samples=10000,
+                embedding_model=embedding_model,
+                random_state=seed,
+                debug=True,
+                row_chunk=50000
+            )
+        ]
+
+    elif method_name == "KMM":
+        if not KAIROS_AVAILABLE:
+            print("⚠ KMM not available, skipping")
+            return []
+        evaluators = [
+            KMM(
+                B=kmm_B,
+                sigma_scale=kmm_sigma_scale,
+                ridge=kmm_ridge,
+                max_iter=kmm_max_iter,
+                use_median_heuristic=True,
+                num_samples=10000,
+                embedding_model=embedding_model,
+                random_state=seed,
+                debug=True,
+                row_chunk=8192
+            )
+        ]
+
+    elif method_name == "KNNOutlier":
+        if not KAIROS_AVAILABLE:
+            print("⚠ KNNOutlier not available, skipping")
+            return []
+        evaluators = [
+            KNNOutlier(
+                k=knno_k,
+                class_conditional=knno_class_conditional,
+                reference=knno_ref,
+                embedding_model=embedding_model,
+                random_state=seed,
+                debug=True
+            )
+        ]
+
+    elif method_name == "KNNConsistency":
+        if not KAIROS_AVAILABLE:
+            print("⚠ KNNConsistency not available, skipping")
+            return []
+        evaluators = [
+            KNNConsistency(
+                k=knnc_k,
+                embedding_model=embedding_model,
+                random_state=seed,
+                debug=True
+            )
+        ]
+
+    elif method_name == "InfluenceFunction":
+        evaluators = [InfluenceFunction()]
+
+    else:
+        raise ValueError(f"Unknown method: {method_name}")
+
+    print(f"  ✓ Created {len(evaluators)} evaluator(s)")
+    return evaluators
+
+
+def run_evaluations(exper_med, output_dir, skip_remove_high_low_for_checkpoints=None, force_skip_remove_high_low=False):
+    """Run all evaluation experiments and save results."""
+    print(f"\n[Evaluate] Running evaluations...")
+    results_dict = {}
+    skip_remove_high_low_for_checkpoints = skip_remove_high_low_for_checkpoints or []
+
+    evaluation_functions = [
+        (noisy_detection, "noisy_detection"),
+        (discover_corrupted_sample, "discover_corrupted_sample"),
+    ]
+
+    # remove_high_low is skipped per checkpoint: evaluators "<Method>CKPT@N" with N in the skip list are left out of
+    # that one evaluation only (noisy_detection, discover_corrupted_sample and the saved values still cover them).
+    should_skip_remove_high_low = False
+    skipped_idx = set()
+    if force_skip_remove_high_low:
+        should_skip_remove_high_low = True
+        print(f"  ⊘ remove_high_low: Skipped unconditionally (--skip-remove-high-low)")
+    elif skip_remove_high_low_for_checkpoints:
+        for idx, ev in enumerate(exper_med.data_evaluators):
+            ev_str = str(ev)
+            if "CKPT@" in ev_str:
+                # Extract checkpoint number from evaluator repr (e.g., "DataOobCKPT@1" -> 1)
+                try:
+                    if int(ev_str.split("@")[1].split("(")[0]) in skip_remove_high_low_for_checkpoints:
+                        skipped_idx.add(idx)
+                except (IndexError, ValueError):
+                    pass
+        if skipped_idx:
+            kept = [str(e).split("(")[0] for i, e in enumerate(exper_med.data_evaluators) if i not in skipped_idx]
+            print(f"  ⊘ remove_high_low: skipping checkpoints in {skip_remove_high_low_for_checkpoints}; running for {kept}")
+            if len(skipped_idx) == len(exper_med.data_evaluators):
+                should_skip_remove_high_low = True
+
+    # Add remove_high_low only if not skipping
+    if not should_skip_remove_high_low:
+        evaluation_functions.append((remove_high_low, "remove_high_low"))
+
+    for eval_func, eval_name in evaluation_functions:
+        all_evaluators = exper_med.data_evaluators
+        try:
+            if eval_name == "remove_high_low" and skipped_idx:
+                exper_med.data_evaluators = [e for i, e in enumerate(all_evaluators) if i not in skipped_idx]
+            result = exper_med.evaluate(eval_func, save_output=True)
+            results_dict[eval_name] = result
+            print(f"  ✓ {eval_name}")
+        except Exception as e:
+            print(f"  ✗ {eval_name}: {str(e)[:60]}")
+            results_dict[eval_name] = None
+        finally:
+            exper_med.data_evaluators = all_evaluators
+
+    try:
+        exper_med.evaluate(save_dataval, save_output=True)
+        print(f"  ✓ data_values saved")
+    except Exception as e:
+        print(f"  ✗ data_values: {e}")
+
+    return results_dict
+
+
+def start_profiler_thread(profiler_obj, interval=1.0):
+    """Start background thread to capture profiler snapshots."""
+    stop_event = threading.Event()
+
+    def snapshot_loop():
+        while not stop_event.is_set():
+            try:
+                profiler_obj.take_snapshot()
+                stop_event.wait(interval)
+            except Exception as e:
+                print(f"[Profiler] Snapshot error: {e}")
+                break
+
+    thread = threading.Thread(target=snapshot_loop, daemon=True)
+    thread.start()
+    return stop_event, thread
+
+
+def save_checkpoint_profiles(method_name, output_dir, evaluators):
+    """Save individual checkpoint profiling data for CKPT methods."""
+    checkpoint_dir = Path(output_dir) / "checkpoint_profiles"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    checkpoint_data = {
+        'method': method_name,
+        'timestamp': pd.Timestamp.now().isoformat(),
+        'checkpoints': {}
+    }
+
+    # Extract checkpoint info from evaluators
+    for idx, evaluator in enumerate(evaluators):
+        evaluator_name = evaluator.__class__.__name__
+
+        # For CKPT methods, get checkpoint information
+        if hasattr(evaluator, 'checkpoints'):
+            ckpt_info = {
+                'checkpoint_count': len(evaluator.checkpoints),
+                'checkpoint_at': list(evaluator.checkpoints.keys()),
+            }
+
+            # Add checkpoint memory reports if available
+            if hasattr(evaluator, 'checkpoint_memory_reports'):
+                ckpt_info['memory_reports'] = {
+                    str(k): v for k, v in evaluator.checkpoint_memory_reports.items()
+                }
+
+            checkpoint_data['checkpoints'][f'evaluator_{idx:02d}_{evaluator_name}'] = ckpt_info
+
+    # Save checkpoint profiles to JSON
+    if checkpoint_data['checkpoints']:
+        ckpt_file = checkpoint_dir / f"{method_name}_checkpoint_profiles.json"
+        with open(ckpt_file, "w") as f:
+            json.dump(checkpoint_data, f, indent=2, default=str)
+        print(f"  ✓ Checkpoint profiles saved: {ckpt_file}")
+        return checkpoint_dir
+
+    return None
+
+
+def generate_overall_report(base_output_dir, method_name, seed, model_name,
+                            compute_stats=None, eval_stats=None, num_evaluators=0):
+    """Aggregate results from all evaluators into overall report with memory/timing stats."""
+    print(f"\n[Overall Report] Aggregating results...")
+
+    report_dir = Path(base_output_dir) / "overall_report"
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    # Collect all evaluation CSVs
+    summary_data = {
+        'experiment': {
+            'method': method_name,
+            'model': model_name,
+            'seed': seed,
+            'num_evaluators': num_evaluators,
+            'timestamp': pd.Timestamp.now().isoformat(),
+        },
+        'performance': {},
+        'memory': {},
+        'timing': {},
+    }
+
+    # Add compute phase stats
+    if compute_stats:
+        summary_data['timing']['compute'] = {
+            'elapsed_seconds': compute_stats.get('elapsed_seconds', 0),
+            'elapsed_formatted': compute_stats.get('elapsed_formatted', ''),
+        }
+        summary_data['memory']['compute'] = {
+            'cpu_peak_mb': compute_stats.get('cpu_peak_mb', 0),
+            'cpu_current_mb': compute_stats.get('cpu_rss_mb', 0),
+            'gpu_peak_allocated_mb': compute_stats.get('gpu_max_allocated_mb', 0),
+            'gpu_peak_reserved_mb': compute_stats.get('gpu_reserved_mb', 0),
+        }
+
+    # Add evaluation phase stats
+    if eval_stats:
+        summary_data['timing']['evaluation'] = {
+            'elapsed_seconds': eval_stats.get('elapsed_seconds', 0),
+            'elapsed_formatted': eval_stats.get('elapsed_formatted', ''),
+        }
+        summary_data['memory']['evaluation'] = {
+            'cpu_peak_mb': eval_stats.get('cpu_peak_mb', 0),
+            'cpu_current_mb': eval_stats.get('cpu_rss_mb', 0),
+            'gpu_peak_allocated_mb': eval_stats.get('gpu_max_allocated_mb', 0),
+            'gpu_peak_reserved_mb': eval_stats.get('gpu_reserved_mb', 0),
+        }
+
+    # Skip file aggregation - CSVs are already in eval directories
+    # File globbing can hang on slow filesystems
+    summary_data['performance']['note'] = 'CSV files are in eval_*/  directories'
+
+    # Generate summary JSON with all metrics
+    summary_file = report_dir / f"{method_name}_overall_summary.json"
+    with open(summary_file, "w") as f:
+        json.dump(summary_data, f, indent=2, default=str)
+
+    print(f"  ✓ Overall report saved to {report_dir}")
+    return report_dir
+
+
+def run_experiment(
+    model_name: str,
+    method_name: str,
+    seed: int,
+    cuda_device: int,
+    output_base: str = "./results",
+    logs_base: str = "./logs",
+    val_batch_size: int = 128,
+    proportion: float = 0.7,
+    subset_size: int = None,
+    num_models: int = 100,
+    checkpoint_models: list = None,
+    skip_remove_high_low: bool = False,
+    lam_y: float = 5.0,
+    lam_x: float = 1.0,
+    k_neighbors: int = 10,
+    dist_rand: float = 7.3622,
+    lsh_t: float = 2.399,
+    n_hash_table: int = 100,
+    lsh_eps: float = 1e-2,
+    lambda_weight: float = 0.97,
+    kmm_B: float = 10.0,
+    kmm_sigma_scale: float = 0.25,
+    kmm_ridge: float = 1.0,
+    kmm_max_iter: int = 5000,
+    knno_k: int = 10,
+    knno_class_conditional: bool = True,
+    knno_ref: str = 'valid',
+    knnc_k: int = 10,
+    embedder: str = "mlp",
+    valid_chunk: int = 512,
+    sava_batch_size: int = 1024
+):
+    """Run complete H100-optimized data valuation experiment."""
+    timestamp_str = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+
+    logger, log_file = setup_logging(method_name, seed, logs_base, timestamp_str)
+    tracker = MemoryTracker()
+    tracker.start()
+
+    logger.info("=" * 90)
+    logger.info(f"H100-OPTIMIZED CIFAR10 DATA VALUATION")
+    logger.info("=" * 90)
+    logger.info(f"Model: {model_name} | Method: {method_name} | Seed: {seed} | CUDA: cuda:{cuda_device}")
+    logger.info(f"Logs: {log_file}")
+    logger.info("=" * 90)
+
+    print("=" * 90)
+    print(f"H100-OPTIMIZED CIFAR10 DATA VALUATION")
+    print("=" * 90)
+    print(f"Model: {model_name} | Method: {method_name} | Seed: {seed} | CUDA: cuda:{cuda_device}")
+    print("=" * 90)
+
+    # Aggressive GPU memory clearing BEFORE any operations
+    import gc
+    gc.collect()
+    try:
+        for _ in range(10):
+            torch.cuda.empty_cache()
+        logger.info("[GPU] Aggressive cache clearing completed")
+    except Exception as e:
+        logger.warning(f"[GPU] Cache clearing failed: {e}")
+
+    logger.info("[Experiment] Creating experiment mediator with H100 optimizations...")
+    exper_med = create_experiment_mediator(model_name, seed, cuda_device)
+
+    # Patch InRunDataShapleyGhost for numpy compatibility
+    if method_name == "InRunDataShapleyGhost":
+        try:
+            from opendataval.dataval.influence.inrun_shapley_ghost import InRunDataShapleyGhost
+
+            original_evaluate = InRunDataShapleyGhost.evaluate_data_values
+
+            def patched_evaluate(self):
+                if self._values is None:
+                    raise RuntimeError("No computed values. Call train_data_values() first.")
+                try:
+                    return self._values.astype(np.float32)
+                except:
+                    logger.warning("⚠ numpy astype failed, using safe copy method")
+                    return np.array(self._values, dtype=np.float32, copy=True)
+
+            InRunDataShapleyGhost.evaluate_data_values = patched_evaluate
+            logger.info("[Patch] Applied safe numpy conversion for InRunDataShapleyGhost")
+        except Exception as e:
+            logger.warning(f"Could not patch InRunDataShapleyGhost: {e}")
+
+    if embedder == "imagenet":
+        embedding_model = create_imagenet_embedding_model(renorm=True)
+    elif embedder == "imagenet_raw":
+        embedding_model = create_imagenet_embedding_model(renorm=False)
+    else:
+        embedding_model = create_embedding_model()
+    logger.info(f"[Methods] Creating {method_name} evaluators...")
+    evaluators = create_method_evaluators(method_name, seed, embedding_model=embedding_model, val_batch_size=val_batch_size, proportion=proportion, subset_size=subset_size, num_models=num_models, checkpoint_models=checkpoint_models, lam_y=lam_y, lam_x=lam_x, k_neighbors=k_neighbors, lambda_weight=lambda_weight, kmm_B=kmm_B, kmm_sigma_scale=kmm_sigma_scale, kmm_ridge=kmm_ridge, kmm_max_iter=kmm_max_iter, knno_k=knno_k, knno_class_conditional=knno_class_conditional, knno_ref=knno_ref, knnc_k=knnc_k, valid_chunk=valid_chunk, sava_batch_size=sava_batch_size, dist_rand=dist_rand, lsh_t=lsh_t, n_hash_table=n_hash_table, lsh_eps=lsh_eps)
+
+    # AUTO-ORGANIZE: Extract config from evaluator and create organized path
+    def get_organized_output_dir(method_name, evaluators, seed, output_base):
+        """Create organized directory structure based on method and config."""
+        import re
+
+        output_base_str = str(output_base)
+        # If path already contains method_name and seed_N, use it directly (avoid double nesting)
+        if method_name in output_base_str and f"seed_{seed}" in output_base_str:
+            return Path(output_base)
+
+        if not evaluators:
+            return Path(output_base) / method_name / f"seed_{seed}"
+
+        ev_str = str(evaluators[0])
+
+        # InRunDataShapleyGhost: organize by val_batch_size
+        if "InRunDataShapleyGhost" in method_name and "val_batch_size" in ev_str:
+            match = re.search(r'val_batch_size=(\d+)', ev_str)
+            if match:
+                vbs = match.group(1)
+                return Path(output_base) / f"inrun_vbs{vbs}" / f"seed_{seed}"
+
+        # LoGRA: flat by seed
+        if "LoGRA" in method_name:
+            return Path(output_base) / "LoGRA" / f"seed_{seed}"
+
+        # InfSub: already organized (InfSub_m100_p0.2, InfSub_m100_p0.7)
+        if "InfSub" in method_name:
+            # Extract method with config suffix
+            base_method = method_name.split("_")[0]  # e.g., "InfSub"
+            config_suffix = "_".join(method_name.split("_")[1:]) if "_" in method_name else ""
+            folder = f"{base_method}_{config_suffix}" if config_suffix else base_method
+            return Path(output_base) / folder / f"seed_{seed}"
+
+        # Default: Method / seed
+        return Path(output_base) / method_name / f"seed_{seed}"
+
+    base_output_dir = get_organized_output_dir(method_name, evaluators, seed, output_base)
+    base_output_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"[Organization] Output path: {base_output_dir.relative_to(Path(output_base).parent)}")
+
+    # InRun writes its debug CSV and training plots to plot_dir (default: the cwd, shared by all jobs -> overwritten).
+    # Point it at this run's own seed folder.
+    for ev in evaluators:
+        if hasattr(ev, "plot_dir"):
+            ev.plot_dir = str(base_output_dir)
+
+    output_dirs = []
+    for idx, ev in enumerate(evaluators):
+        suffix = get_evaluator_suffix(ev)
+        eval_output_dir = base_output_dir / f"eval_{idx:02d}_{suffix}"
+        eval_output_dir.mkdir(parents=True, exist_ok=True)
+        output_dirs.append(str(eval_output_dir))
+
+    if output_dirs:
+        exper_med.set_output_directory(output_dirs[0])
+        print(f"Output (base): {base_output_dir}")
+        print(f"Output (subdirs): {len(output_dirs)} evaluators")
+    else:
+        output_dir = base_output_dir / "eval_00_default"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        exper_med.set_output_directory(str(output_dir))
+        print(f"Output: {output_dir}")
+
+    if not evaluators:
+        logger.warning(f"No evaluators created for {method_name}")
+        return None
+
+    logger.info(f"✓ Created {len(evaluators)} evaluators")
+    print(f"✓ Created {len(evaluators)} evaluators")
+
+    logger.info(f"[Compute] Computing data values...")
+    compute_tracker = MemoryTracker()
+    compute_tracker.start()
+
+    # Setup comprehensive profiler for compute phase (skip for LoGRA - too many snapshots)
+    compute_profiler = None
+    compute_stop_event = None
+    compute_thread = None
+    profiler_dir = base_output_dir / "profiler"
+    try:
+        profiler_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"⚠ [Profiler] Failed to create profiler directory: {e}")
+        profiler_dir = None
+
+    if PROFILER_AVAILABLE and "LoGRA" not in method_name and profiler_dir:
+        try:
+            compute_profiler = ComprehensiveProfiler(
+                method_name=method_name,
+                output_dir=str(profiler_dir),
+                model=embedding_model,  # Pass embedding model for parameter counting
+                device=f"cuda:{cuda_device}" if torch.cuda.is_available() else "cpu"
+            )
+            compute_profiler.start_profiling()
+            compute_stop_event, compute_thread = start_profiler_thread(compute_profiler, interval=0.5)
+        except Exception as e:
+            print(f"⚠ [Profiler] Failed to initialize compute profiler: {e}")
+            compute_profiler = None
+            compute_stop_event = None
+            compute_thread = None
+
+    try:
+        exper_med = exper_med.compute_data_values(data_evaluators=evaluators)
+        logger.info(f"✓ Computation complete")
+        print(f"✓ Computation complete")
+    except Exception as e:
+        if "Illegal instruction" in str(e) or "core dumped" in str(e):
+            logger.warning(f"⚠ Computation succeeded but crashed during result processing (GhostSuite issue)")
+            print(f"⚠ Values computed successfully but crashed during return (GhostSuite CPU issue)")
+        else:
+            logger.error(f"✗ Computation failed: {e}")
+            print(f"✗ Computation failed: {e}")
+            return None
+    finally:
+        try:
+            if compute_stop_event:
+                compute_stop_event.set()
+        except Exception as e:
+            print(f"⚠ [Profiler] Failed to stop compute profiler thread: {e}")
+
+        try:
+            if compute_thread:
+                compute_thread.join(timeout=5)
+        except Exception as e:
+            print(f"⚠ [Profiler] Failed to join compute profiler thread: {e}")
+
+        if compute_profiler:
+            try:
+                compute_profiler.end_profiling()
+                # Populate ALL metrics before generating outputs
+                print(f"[Profiler] Collecting metrics for {method_name}...")
+                try:
+                    print(f"  [Step 1/7] get_hardware_stats...", flush=True)
+                    compute_profiler.get_hardware_stats()
+                    print(f"  [Step 2/7] get_timing_stats...", flush=True)
+                    compute_profiler.get_timing_stats()
+                    print(f"  [Step 3/7] get_memory_stats...", flush=True)
+                    compute_profiler.get_memory_stats()
+                    # Get data size from experiment mediator
+                    n_samples = getattr(exper_med, '_train_count', 40000)
+                    print(f"  [Step 4/7] count_flops...", flush=True)
+                    compute_profiler.count_flops(n_samples, 128, 10)
+                    print(f"  [Step 5/7] count_parameters...", flush=True)
+                    compute_profiler.count_parameters()
+                    print(f"  [Step 6/7] estimate_memory_transfer...", flush=True)
+                    compute_profiler.estimate_memory_transfer(n_samples, 128)
+                    print(f"  [Step 7/7] generate_all_outputs...", flush=True)
+                    compute_profiler.generate_all_outputs()
+                    print(f"  ✓ Metrics collected and reports generated")
+                except Exception as e:
+                    print(f"  ⚠ Profiler error (continuing): {e}")
+            except Exception as e:
+                print(f"⚠ [Profiler] Failed to end compute profiler: {e}")
+
+    print("[Debug] Ending compute_tracker...", flush=True)
+    try:
+        compute_stats = compute_tracker.end()
+        print(f"[Debug] compute_tracker.end() complete: {compute_stats['elapsed_formatted']}", flush=True)
+    except Exception as e:
+        print(f"⚠ [MemoryTracker] Failed to end compute_tracker: {e}")
+        compute_stats = {'elapsed_seconds': 0, 'elapsed_formatted': 'unknown', 'cpu_peak_mb': 0, 'cpu_rss_mb': 0, 'gpu_allocated_mb': 0, 'gpu_reserved_mb': 0, 'gpu_max_allocated_mb': 0}
+
+    logger.info("[Evaluate] Running evaluations...")
+    eval_tracker = MemoryTracker()
+    eval_tracker.start()
+
+    # Setup comprehensive profiler for evaluation phase (skip for LoGRA - too many snapshots)
+    eval_profiler = None
+    eval_stop_event = None
+    eval_thread = None
+    if PROFILER_AVAILABLE and "LoGRA" not in method_name and profiler_dir:
+        try:
+            eval_profiler = ComprehensiveProfiler(
+                method_name=f"{method_name}_eval",
+                output_dir=str(profiler_dir),
+                model=embedding_model,  # Pass embedding model for parameter counting
+                device=f"cuda:{cuda_device}" if torch.cuda.is_available() else "cpu"
+            )
+            eval_profiler.start_profiling()
+            eval_stop_event, eval_thread = start_profiler_thread(eval_profiler, interval=0.1)  # Faster for shorter eval phase
+        except Exception as e:
+            print(f"⚠ [Profiler] Failed to initialize eval profiler: {e}")
+            eval_profiler = None
+            eval_stop_event = None
+            eval_thread = None
+
+    skip_remove_high_low_for_checkpoints = [1,5,10]   # DOOB: removal curves only for 50 and 100 models (time)
+    results_dict = run_evaluations(exper_med, str(base_output_dir), skip_remove_high_low_for_checkpoints=skip_remove_high_low_for_checkpoints, force_skip_remove_high_low=skip_remove_high_low)
+
+    try:
+        if eval_stop_event:
+            eval_stop_event.set()
+    except Exception as e:
+        print(f"⚠ [Profiler] Failed to stop eval profiler thread: {e}")
+
+    try:
+        if eval_thread:
+            eval_thread.join(timeout=5)
+    except Exception as e:
+        print(f"⚠ [Profiler] Failed to join eval profiler thread: {e}")
+
+    if eval_profiler:
+        try:
+            eval_profiler.end_profiling()
+            # Populate ALL metrics before generating outputs
+            print(f"[Profiler] Collecting metrics for {method_name} (eval phase)...")
+            try:
+                print(f"  [Step 1/7] get_hardware_stats...", flush=True)
+                eval_profiler.get_hardware_stats()
+                print(f"  [Step 2/7] get_timing_stats...", flush=True)
+                eval_profiler.get_timing_stats()
+                print(f"  [Step 3/7] get_memory_stats...", flush=True)
+                eval_profiler.get_memory_stats()
+                # Get data size from experiment mediator
+                n_samples = getattr(exper_med, '_train_count', 40000)
+                print(f"  [Step 4/7] count_flops...", flush=True)
+                eval_profiler.count_flops(n_samples, 128, 10)
+                print(f"  [Step 5/7] count_parameters...", flush=True)
+                eval_profiler.count_parameters()
+                print(f"  [Step 6/7] estimate_memory_transfer...", flush=True)
+                eval_profiler.estimate_memory_transfer(n_samples, 128)
+                print(f"  [Step 7/7] generate_all_outputs...", flush=True)
+                eval_profiler.generate_all_outputs()
+                print(f"  ✓ Metrics collected and reports generated")
+            except Exception as e:
+                print(f"  ⚠ Profiler error (continuing): {e}")
+        except Exception as e:
+            print(f"⚠ [Profiler] Failed to end eval profiler: {e}")
+
+    print("[Debug] Ending eval_tracker...", flush=True)
+    try:
+        eval_stats = eval_tracker.end()
+        print(f"[Debug] eval_tracker.end() complete: {eval_stats['elapsed_formatted']}", flush=True)
+    except Exception as e:
+        print(f"⚠ [MemoryTracker] Failed to end eval_tracker: {e}")
+        eval_stats = {'elapsed_seconds': 0, 'elapsed_formatted': 'unknown', 'cpu_peak_mb': 0, 'cpu_rss_mb': 0, 'gpu_allocated_mb': 0, 'gpu_reserved_mb': 0, 'gpu_max_allocated_mb': 0}
+
+    # Save checkpoint profiles for CKPT methods
+    logger.info("[Checkpoints] Saving checkpoint profiles...")
+    try:
+        save_checkpoint_profiles(method_name, base_output_dir, evaluators)
+    except Exception as e:
+        print(f"⚠ [Checkpoints] Failed to save checkpoint profiles: {e}")
+
+    # Generate overall report with memory/timing stats
+    logger.info("[Report] Generating overall report...")
+    try:
+        generate_overall_report(
+            base_output_dir,
+            method_name,
+            seed,
+            model_name,
+            compute_stats=compute_stats,
+            eval_stats=eval_stats,
+            num_evaluators=len(evaluators)
+        )
+    except Exception as e:
+        print(f"⚠ [Report] Failed to generate overall report: {e}")
+
+    # Distribute evaluation results
+    logger.info("[Distribute] Copying evaluation results to all evaluator directories...")
+    try:
+        import shutil
+        from glob import glob
+
+        first_eval_dir = Path(output_dirs[0]) if output_dirs else None
+        if first_eval_dir:
+            csv_files = list(first_eval_dir.glob("*.csv"))
+            if csv_files and len(output_dirs) > 1:
+                for idx, target_dir in enumerate(output_dirs[1:], start=1):
+                    target_dir = Path(target_dir)
+                    for csv_file in csv_files:
+                        try:
+                            shutil.copy2(csv_file, target_dir / csv_file.name)
+                        except Exception as e:
+                            logger.warning(f"Could not copy {csv_file.name} to eval_{idx:02d}: {e}")
+    except Exception as e:
+        print(f"⚠ [Distribute] Failed to distribute CSV results: {e}")
+
+    print("[Debug] Ending overall tracker...", flush=True)
+    try:
+        final_stats = tracker.end()
+        print(f"[Debug] tracker.end() complete: {final_stats['elapsed_formatted']}", flush=True)
+    except Exception as e:
+        print(f"⚠ [MemoryTracker] Failed to end overall tracker: {e}")
+        final_stats = {'elapsed_seconds': 0, 'elapsed_formatted': 'unknown', 'cpu_peak_mb': 0, 'cpu_rss_mb': 0, 'gpu_allocated_mb': 0, 'gpu_reserved_mb': 0, 'gpu_max_allocated_mb': 0}
+
+    # Summary
+    summary = {
+        'experiment': {
+            'method': method_name,
+            'model': model_name,
+            'seed': seed,
+            'cuda_device': cuda_device,
+            'dataset': 'cifar10',
+            'num_evaluators': len(evaluators),
+            'timestamp': pd.Timestamp.now().isoformat(),
+            'h100_optimized': True,
+            'unified_config': UNIFIED_CONFIG_AVAILABLE,
+            'output_directory': str(base_output_dir),
+            'measurement_methodology': 'Conference-standard (ICML/NeurIPS/ICLR): incremental consumption relative to baseline'
+        },
+        'timing': {
+            'compute_seconds': compute_stats['elapsed_seconds'],
+            'compute_formatted': compute_stats['elapsed_formatted'],
+            'evaluation_seconds': eval_stats['elapsed_seconds'],
+            'evaluation_formatted': eval_stats['elapsed_formatted'],
+            'total_seconds': final_stats['elapsed_seconds'],
+            'total_formatted': final_stats['elapsed_formatted']
+        },
+        'memory': {
+            # Overall experiment (from start to end)
+            'overall': {
+                'baseline_cpu_rss_mb': final_stats['baseline_cpu_rss_mb'],
+                'baseline_gpu_allocated_mb': final_stats['baseline_gpu_allocated_mb'],
+                'baseline_gpu_reserved_mb': final_stats['baseline_gpu_reserved_mb'],
+                'peak_cpu_rss_mb': final_stats['peak_cpu_rss_mb'],
+                'peak_gpu_allocated_mb': final_stats['peak_gpu_allocated_mb'],
+                'peak_gpu_reserved_mb': final_stats['peak_gpu_reserved_mb'],
+                'delta_cpu_mb': final_stats['delta_cpu_mb'],
+                'delta_gpu_allocated_mb': final_stats['delta_gpu_allocated_mb'],
+                'delta_gpu_reserved_mb': final_stats['delta_gpu_reserved_mb'],
+            },
+            # Compute phase only
+            'compute_phase': {
+                'baseline_cpu_rss_mb': compute_stats.get('baseline_cpu_rss_mb', 0),
+                'baseline_gpu_allocated_mb': compute_stats.get('baseline_gpu_allocated_mb', 0),
+                'baseline_gpu_reserved_mb': compute_stats.get('baseline_gpu_reserved_mb', 0),
+                'peak_cpu_rss_mb': compute_stats.get('peak_cpu_rss_mb', 0),
+                'peak_gpu_allocated_mb': compute_stats.get('peak_gpu_allocated_mb', 0),
+                'peak_gpu_reserved_mb': compute_stats.get('peak_gpu_reserved_mb', 0),
+                'delta_cpu_mb': compute_stats.get('delta_cpu_mb', 0),
+                'delta_gpu_allocated_mb': compute_stats.get('delta_gpu_allocated_mb', 0),
+                'delta_gpu_reserved_mb': compute_stats.get('delta_gpu_reserved_mb', 0),
+            },
+            # Evaluation phase only
+            'evaluation_phase': {
+                'baseline_cpu_rss_mb': eval_stats.get('baseline_cpu_rss_mb', 0),
+                'baseline_gpu_allocated_mb': eval_stats.get('baseline_gpu_allocated_mb', 0),
+                'baseline_gpu_reserved_mb': eval_stats.get('baseline_gpu_reserved_mb', 0),
+                'peak_cpu_rss_mb': eval_stats.get('peak_cpu_rss_mb', 0),
+                'peak_gpu_allocated_mb': eval_stats.get('peak_gpu_allocated_mb', 0),
+                'peak_gpu_reserved_mb': eval_stats.get('peak_gpu_reserved_mb', 0),
+                'delta_cpu_mb': eval_stats.get('delta_cpu_mb', 0),
+                'delta_gpu_allocated_mb': eval_stats.get('delta_gpu_allocated_mb', 0),
+                'delta_gpu_reserved_mb': eval_stats.get('delta_gpu_reserved_mb', 0),
+            },
+        },
+    }
+
+    print("\n" + "=" * 90)
+    print("EXPERIMENT SUMMARY (Conference-Standard Measurement)")
+    print("=" * 90)
+    print(f"Model:               {model_name}")
+    print(f"Method:              {method_name}")
+    print(f"Seed:                {seed}")
+    print(f"Evaluators:          {len(evaluators)}")
+    print(f"Total Time:          {summary['timing']['total_formatted']}")
+    print(f"\nMEMORY (Incremental Δ from baseline):")
+    print(format_memory_report(final_stats, phase_name="Full Experiment"))
+    print(f"\nH100 Optimized:      ✓ Yes (torch.compile, AMP, channels-last, CosineAnnealingLR)")
+    print("=" * 90 + "\n")
+
+    # Save summary
+    summary_path = base_output_dir / "experiment_summary.json"
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+    logger.info(f"✓ Summary saved to {summary_path}")
+
+    # Create consolidated Time_Memory_FLOPs report
+    tmf_report_dir = base_output_dir / "Time_Memory_FLOPs_report"
+    tmf_report_dir.mkdir(parents=True, exist_ok=True)
+
+    tmf_report = {
+        'metadata': {
+            'method': method_name,
+            'model': model_name,
+            'seed': seed,
+            'dataset': 'cifar10',
+            'timestamp': pd.Timestamp.now().isoformat(),
+            'measurement_methodology': 'Conference-standard (ICML/NeurIPS/ICLR): delta from baseline'
+        },
+        'timing': {
+            'compute_phase_seconds': compute_stats['elapsed_seconds'],
+            'compute_phase_formatted': compute_stats['elapsed_formatted'],
+            'evaluation_phase_seconds': eval_stats['elapsed_seconds'],
+            'evaluation_phase_formatted': eval_stats['elapsed_formatted'],
+            'total_seconds': final_stats['elapsed_seconds'],
+            'total_formatted': final_stats['elapsed_formatted']
+        },
+        'memory_delta_mb': {
+            'overall': {
+                'cpu': final_stats['delta_cpu_mb'],
+                'gpu_allocated': final_stats['delta_gpu_allocated_mb'],
+                'gpu_reserved': final_stats['delta_gpu_reserved_mb'],
+            },
+            'compute_phase': {
+                'cpu': compute_stats.get('delta_cpu_mb', 0),
+                'gpu_allocated': compute_stats.get('delta_gpu_allocated_mb', 0),
+                'gpu_reserved': compute_stats.get('delta_gpu_reserved_mb', 0),
+            },
+            'evaluation_phase': {
+                'cpu': eval_stats.get('delta_cpu_mb', 0),
+                'gpu_allocated': eval_stats.get('delta_gpu_allocated_mb', 0),
+                'gpu_reserved': eval_stats.get('delta_gpu_reserved_mb', 0),
+            }
+        },
+        'memory_baseline_mb': {
+            'cpu_rss': final_stats['baseline_cpu_rss_mb'],
+            'gpu_allocated': final_stats['baseline_gpu_allocated_mb'],
+            'gpu_reserved': final_stats['baseline_gpu_reserved_mb'],
+        },
+        'memory_peak_mb': {
+            'cpu_rss': final_stats['peak_cpu_rss_mb'],
+            'gpu_allocated': final_stats['peak_gpu_allocated_mb'],
+            'gpu_reserved': final_stats['peak_gpu_reserved_mb'],
+        },
+        'flops': {
+            'compute_flops_billion': compute_stats.get('flops_billion', 0),
+        },
+        'efficiency': {
+            'flops_per_second_compute': compute_stats.get('flops_billion', 0) * 1e9 / max(compute_stats['elapsed_seconds'], 1),
+            'memory_efficiency_flops_per_mb': (compute_stats.get('flops_billion', 0) * 1e9) / max(compute_stats.get('delta_gpu_allocated_mb', 1), 1),
+        }
+    }
+
+    tmf_path = tmf_report_dir / f"{method_name}_Time_Memory_FLOPs.json"
+    with open(tmf_path, 'w') as f:
+        json.dump(tmf_report, f, indent=2)
+    logger.info(f"✓ Time_Memory_FLOPs report saved to {tmf_path}")
+    print(f"[Report] Time_Memory_FLOPs: {tmf_path}")
+
+    # Clear GPU memory at end of seed
+    try:
+        torch.cuda.empty_cache()
+        logger.info("[GPU] Cache cleared at end of seed")
+    except Exception as e:
+        logger.warning(f"[GPU] Failed to clear cache: {e}")
+
+    return summary
+
+
+def run_meta():
+    """Provenance stored next to results: SLURM job id and git commit."""
+    import subprocess
+    try:
+        commit = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=str(Path(__file__).parent),
+                                         stderr=subprocess.DEVNULL, text=True).strip()
+    except Exception:
+        commit = None
+    return {"job_id": os.environ.get("SLURM_JOB_ID"), "git_commit": commit}
+
+
+def run_baseline(model_name, seed, cuda_device, noise_rate, output_base="results"):
+    """Train one baseline model on the full train split (same fit recipe) and report test accuracy."""
+    exper_med = create_experiment_mediator(model_name, seed, cuda_device, noise_rate=noise_rate)
+    x_train, y_train, x_valid, y_valid, x_test, y_test = exper_med.fetcher.datapoints
+    model = exper_med.pred_model.clone()
+    tracker = MemoryTracker()
+    tracker.start()
+    t0 = time.time()
+    logs = model.fit(x_train, y_train, **exper_med.train_kwargs, x_valid=x_valid, y_valid=y_valid,
+                     x_test=x_test, y_test=y_test)
+    train_time = time.time() - t0
+    mem = tracker.end()
+    pred = model.predict(x_test).cpu()
+    y = torch.as_tensor(y_test)
+    y = y.argmax(1) if y.ndim > 1 else y.long()
+    test_acc = (pred.argmax(1) == y).float().mean().item()
+    res = {**run_meta(), "model": model_name, "seed": seed, "noise_rate": noise_rate, "test_accuracy": test_acc,
+           "train_time_s": train_time, "epoch_losses": (logs or {}).get("epoch_losses"),
+           "train_kwargs": exper_med.train_kwargs, "memory": mem}
+    out = Path(output_base) / f"baseline_noise{noise_rate}" / f"seed_{seed}"
+    out.mkdir(parents=True, exist_ok=True)
+    with open(out / "baseline.json", "w") as fh:
+        json.dump(res, fh, indent=2, default=str)
+    print(f"\n✓ Baseline {model_name} noise={noise_rate} seed={seed}: test_acc={test_acc:.4f} ({train_time:.1f}s)")
+    print(f"  Saved: {out / 'baseline.json'}")
+    return res
+
+
+def main():
+    """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description="H100-Optimized CIFAR10 Data Valuation for ResNet Models (Unified Pipeline)"
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="cifarmlp",
+        choices=["cifarmlp", "rn9", "resnet18", "resnet34", "resnet50", "rn110"],
+        help="ResNet model to use (all use identical H100-optimized config)"
+    )
+    parser.add_argument("--method", type=str, default="LoGRA", help="Data valuation method")
+    parser.add_argument("--cuda", type=int, default=0, help="CUDA device ID")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--val_batch_size", type=int, default=128, help="Validation batch size")
+    parser.add_argument("--proportion", type=float, default=0.7, help="Proportion for DataOob")
+    parser.add_argument("--subset_size", type=int, default=None, help="Fixed subset size for InfluenceSubsampleCKPT (overrides proportion)")
+    parser.add_argument("--output-base", type=str, default="./results", help="Output base directory")
+    parser.add_argument("--logs-base", type=str, default="./logs", help="Logs base directory")
+    parser.add_argument("--num_models", type=int, default=100, help="Number of models for DataOobCKPT")
+    parser.add_argument("--checkpoints", type=str, default=None, help="Comma-separated checkpoint model counts for DataOobCKPT, e.g. 1,5,10")
+    parser.add_argument("--skip-remove-high-low", action="store_true", help="Skip the remove_high_low evaluation entirely")
+    parser.add_argument("--lam_y", type=float, default=5.0, help="lam_y for LAVA")
+    parser.add_argument("--lam_x", type=float, default=1.0, help="lam_x for LAVA")
+    parser.add_argument("--sava_batch_size", type=int, default=1024, help="batch_size for SAVA")
+    parser.add_argument("--dist_rand", type=float, default=7.3622,
+                        help="AKShapley LSH scale; should be the embeddings' mean "
+                             "pairwise distance. <=0 estimates it from data (needs eps<=1/k).")
+    parser.add_argument("--lsh_t", type=float, default=2.399, help="AKShapley LSH bucket width")
+    parser.add_argument("--n_hash_table", type=int, default=100, help="AKShapley LSH tables")
+    parser.add_argument("--lsh_eps", type=float, default=1e-2,
+                        help="AKShapley retrieval depth: K_star = max(k_neighbors, ceil(1/eps))")
+    parser.add_argument("--k_neighbors", type=int, default=10, help="k for KNNShapley")
+    parser.add_argument("--embedder", type=str, default="mlp", choices=["mlp","resnet9","imagenet","imagenet_raw"], help="which embedding model to use")
+    parser.add_argument("--lambda_weight", type=float, default=0.97, help="lambda_weight for Kairos")
+    parser.add_argument("--kmm_B", type=float, default=10.0, help="weight upper bound B for KMM")
+    parser.add_argument("--kmm_sigma_scale", type=float, default=0.25, help="KMM: multiplier on median-heuristic bandwidth")
+    parser.add_argument("--kmm_ridge", type=float, default=1.0, help="KMM: ridge strength towards beta=1")
+    parser.add_argument("--kmm_max_iter", type=int, default=5000, help="KMM: FISTA iteration cap")
+    parser.add_argument("--knno_k", type=int, default=10, help="KNNOutlier: number of neighbours")
+    parser.add_argument("--knno_ref", type=str, default="valid", choices=["valid", "train"], help="KNNOutlier: neighbours from the validation set ('valid') or the other training points ('train')")
+    parser.add_argument("--knnc_k", type=int, default=10, help="KNNConsistency: number of nearest validation points")
+    parser.add_argument("--knno_global", action="store_true", help="KNNOutlier: search neighbours globally instead of within the labelled class")
+    parser.add_argument("--valid_chunk", type=int, default=512, help="validation points per batched pass (KNNShapleyVec)")
+
+    parser.add_argument("--train_baseline", action="store_true", help="only train a baseline model and report test accuracy (no data valuation)")
+    parser.add_argument("--noise_rate", type=float, default=0.2, help="label-noise rate (used with --train_baseline)")
+
+    args = parser.parse_args()
+
+    if args.train_baseline:
+        run_baseline(args.model, args.seed, args.cuda, args.noise_rate)
+        return
+
+    checkpoint_models = [int(c) for c in args.checkpoints.split(",")] if args.checkpoints else None
+
+    # Print H100 optimization info
+    print("\n" + "=" * 90)
+    print("H100-OPTIMIZED TRAINING PIPELINE")
+    print("=" * 90)
+    print("✓ torch.compile enabled (reduce-overhead mode)")
+    print("✓ Automatic Mixed Precision (bfloat16)")
+    print("✓ CosineAnnealingLR scheduler")
+    print("✓ Adam optimizer with LR=0.001")
+    print("✓ Channels-last memory format")
+    print("✓ Large batch size (1024) optimization")
+    print("✓ Gradient clipping for stability")
+    print("✓ Unified configuration (fair comparison)")
+    print("=" * 90 + "\n")
+
+    if UNIFIED_CONFIG_AVAILABLE:
+        try:
+            print_training_config(args.model)
+        except ValueError:
+            pass  # unified_config.py does not list this model (cifarmlp / cifarcnn)
+
+    run_experiment(
+        model_name=args.model,
+        method_name=args.method,
+        seed=args.seed,
+        cuda_device=args.cuda,
+        output_base=args.output_base,
+        logs_base=args.logs_base,
+        val_batch_size=args.val_batch_size,
+        proportion=args.proportion,
+        subset_size=args.subset_size,
+        num_models=args.num_models,
+        checkpoint_models=checkpoint_models,
+        skip_remove_high_low=args.skip_remove_high_low,
+        lam_y=args.lam_y,
+        lam_x=args.lam_x,
+        sava_batch_size=args.sava_batch_size,
+        k_neighbors=args.k_neighbors,
+        dist_rand=args.dist_rand,
+        lsh_t=args.lsh_t,
+        n_hash_table=args.n_hash_table,
+        lsh_eps=args.lsh_eps,
+        lambda_weight=args.lambda_weight,
+        kmm_B=args.kmm_B,
+        kmm_sigma_scale=args.kmm_sigma_scale,
+        kmm_ridge=args.kmm_ridge,
+        kmm_max_iter=args.kmm_max_iter,
+        knno_k=args.knno_k,
+        knno_class_conditional=not args.knno_global,
+        knno_ref=args.knno_ref,
+        knnc_k=args.knnc_k,
+        embedder=args.embedder,
+        valid_chunk=args.valid_chunk
+    )
+
+
+if __name__ == "__main__":
+    main()
