@@ -4,6 +4,19 @@
 
 Experimental benchmark for data valuation methods in machine learning, covering fine-grained and coarse-grained granularities across diverse datasets, tasks, and scales.
 
+**Paper:** [accepted version](./paper.pdf) · [extended version](./paper-extended.pdf) (with the full parameter tuning, evaluation and scalability results)
+
+## Abstract
+
+Data valuation assigns a quantitative measure of importance to data with respect to a given objective. In machine learning, the objective is often model performance, but could more broadly be any measurable property of the learning pipeline. It enables a wide range of uses including efficient training set selection, informed data curation, robustness and fairness in ML, and the design of incentive-aligned data markets. This paper conducts the first comprehensive experimental evaluation of data valuation methods spanning different granularities of data value. First, we propose a unified formal framework that introduces two complementary notions of data value: (i) coarse-grained valuation, which assigns a scalar value to a dataset as a whole, and (ii) fine-grained valuation, which assigns a scalar value to subsets of the data. Two generic operators, data value aggregation and data value attribution, formalize the relationship between the two granularities. We show that the evaluated methods are recovered as instantiations of this framework. Second, we propose a taxonomy that classifies data valuation methods by the information they require from the learning pipeline. Third, we perform an extensive experimental evaluation of the efficiency/accuracy/memory trade-offs of state-of-the-art valuation methods across eleven datasets. We describe the strengths and limitations of the methods, share new insights about their inner workings, summarize key lessons learned, and pinpoint promising research directions in the field.
+
+## Key Contributions
+
+- **Unified framework and taxonomy.** A formal framework that unifies data valuation methods, distinguishing coarse- and fine-grained valuation with respect to a generic context and relating the two through aggregation and attribution operators, and a taxonomy that classifies methods by the information they require from the learning pipeline: the task, the model, and the level of model access. The evaluated methods are instantiations of the framework.
+- **First experimental evaluation of both granularities.** Thirteen state-of-the-art methods (seventeen techniques counting variants), each tuned to its accuracy/efficiency Pareto frontier, on eleven tabular and image datasets from medicine, social science, gaming, biology and physics, in classification and regression, evaluated on accuracy, efficiency and memory.
+- **Scalability study.** Scalability along dataset size (up to 7M points) and model class and size (up to 58M parameters): what the cost of each branch of the taxonomy scales with, and how high- and low-valued points change with the model. The study also characterizes what the validation set provides, through domain adaptation, and what it costs in accuracy and time.
+- **Lessons and research directions.** Six lessons summarizing the results, to our knowledge not reported before, and the research directions they lead to. All artifacts are shared in this repository for reproducibility.
+
 ---
 # Use Case
 
